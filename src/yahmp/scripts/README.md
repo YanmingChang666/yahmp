@@ -27,6 +27,17 @@ uv run python -m yahmp.scripts.data.convert_pkl_dataset_to_npz \
   --output-root assets/motions/g1_motions_npz
 ```
 
+### `expand_npz_motion_dataset.py`
+
+Expand compact NPZ motions into deploy-friendly NPZs with precomputed joint
+velocities and body world kinematics:
+
+```bash
+uv run python -m yahmp.scripts.data.expand_npz_motion_dataset \
+  --input-root assets/motions/g1_omomo_amass_clean \
+  --output-root assets/motions/g1_omomo_amass_clean_full
+```
+
 ### `render_reference_motions.py`
 
 Renders one `.mp4` per reference motion clip. The output folder mirrors the motion source subfolder layout.
