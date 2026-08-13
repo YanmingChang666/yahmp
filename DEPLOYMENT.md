@@ -304,12 +304,33 @@ remains.
 
 ### 5.2 Live ChingMu teleoperation
 
+The retargeted **robot skeleton** is streamed on a **dedicated VRPN port** (e.g.
+`:3884`), typically with the **root at sensor 301** and **joints from sensor
+302** — distinct from the ball/marker stream on the default port. The values
+below are from a working G1 setup; confirm yours with the hierarchy dump.
+
+**Step 1 — kinematic replay (validate the remap, no policy).** This writes the
+mocap pose straight to the G1's `qpos` — the model should mirror the human
+limb-for-limb. Fix joint order / frame here *before* closing the policy loop:
+
 ```bash
 uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mocap \
   --task-id Mjlab-YAHMP-Unitree-G1 --onnx-path assets/models/g1_yahmp.onnx \
-  --source chingmu \
-  --chingmu-host MCAvatar@192.168.123.112 \
-  --sensor-root 0 --sensor-joint-first 1 \
+  --source chingmu --mode replay \
+  --chingmu-host MCAvatar@192.168.123.112:3884 \
+  --sensor-root 301 --sensor-joint-first 302 \
+  --joint-order config/chingmu_joint_order.json
+```
+
+**Step 2 — close the policy loop (teleoperation).** Once replay looks right,
+swap to `--mode teleop`: a simulated G1 now *tracks* the human via the policy:
+
+```bash
+uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mocap \
+  --task-id Mjlab-YAHMP-Unitree-G1 --onnx-path assets/models/g1_yahmp.onnx \
+  --source chingmu --mode teleop \
+  --chingmu-host MCAvatar@192.168.123.112:3884 \
+  --sensor-root 301 --sensor-joint-first 302 \
   --joint-order config/chingmu_joint_order.json \
   --vel-smoothing 0.7
 ```

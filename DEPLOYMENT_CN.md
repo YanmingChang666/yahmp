@@ -290,12 +290,31 @@ uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mocap \
 
 ### 5.2 ChingMu 实时遥操作
 
+重定向后的**机器人骨架**通常在**独立的 VRPN 端口**上推流（如 `:3884`），一般
+**根在传感器 301**、**关节从传感器 302 开始**——与默认端口上的球/marker 流不同。
+下面用的是某个可用 G1 配置的值；请用层级导出命令确认你自己的值。
+
+**第 1 步——运动学回放（先验证映射，不接策略）。** 直接把动捕姿态写进 G1 的
+`qpos`，模型应当与真人**逐肢体**一致。先在这里修好关节顺序 / 坐标系，再闭合策略环：
+
 ```bash
 uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mocap \
   --task-id Mjlab-YAHMP-Unitree-G1 --onnx-path assets/models/g1_yahmp.onnx \
-  --source chingmu \
-  --chingmu-host MCAvatar@192.168.123.112 \
-  --sensor-root 0 --sensor-joint-first 1 \
+  --source chingmu --mode replay \
+  --chingmu-host MCAvatar@192.168.123.112:3884 \
+  --sensor-root 301 --sensor-joint-first 302 \
+  --joint-order config/chingmu_joint_order.json
+```
+
+**第 2 步——闭合策略环（遥操作）。** 回放正确后，切换到 `--mode teleop`：仿真 G1
+现在通过策略**跟踪**真人：
+
+```bash
+uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mocap \
+  --task-id Mjlab-YAHMP-Unitree-G1 --onnx-path assets/models/g1_yahmp.onnx \
+  --source chingmu --mode teleop \
+  --chingmu-host MCAvatar@192.168.123.112:3884 \
+  --sensor-root 301 --sensor-joint-first 302 \
   --joint-order config/chingmu_joint_order.json \
   --vel-smoothing 0.7
 ```

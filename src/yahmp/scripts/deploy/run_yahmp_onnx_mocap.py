@@ -383,12 +383,56 @@ class NpzMockSource:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Kinematic full-body replay (no policy) — mocap → MuJoCo qpos, for validation
+# ══════════════════════════════════════════════════════════════════════════════
+def _run_kinematic_replay(
+  model,
+  data,
+  spec: PolicySpec,
+  reference: "LiveReference",
+  viewer_cfg,
+  joint_qpos_adr: np.ndarray,
+  root_qpos_adr: int,
+  source,
+) -> None:
+  """Write the live mocap pose straight into the model's qpos and render — no
+  policy, no physics. Mirrors `replay_chingmu_sim.py --robot-src vrpn`.
+
+  Use this to visually verify the joint-order map and frame calibration: the G1
+  model should mimic the human limb-for-limb. Once correct, switch to
+  `--mode teleop` to close the policy loop.
+  """
+  import mujoco.viewer as mujoco_viewer
+
+  print(
+    "[INFO] Kinematic replay (no policy). Verify the G1 mirrors the human "
+    "limb-for-limb, then rerun with --mode teleop."
+  )
+  with mujoco_viewer.launch_passive(model, data) as viewer:
+    _configure_camera(viewer, model, spec.root_body_name, viewer_cfg)
+    try:
+      while viewer.is_running():
+        t0 = time.perf_counter()
+        frame = reference.sample(0.0)
+        data.qpos[root_qpos_adr : root_qpos_adr + 3] = frame.root_pos_w
+        data.qpos[root_qpos_adr + 3 : root_qpos_adr + 7] = frame.root_quat_w
+        data.qpos[joint_qpos_adr] = frame.joint_pos
+        data.qvel[:] = 0.0
+        mujoco.mj_forward(model, data)
+        viewer.sync()
+        time.sleep(max(0.0, 0.02 - (time.perf_counter() - t0)))  # ~50 Hz
+    finally:
+      source.stop()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main loop
 # ══════════════════════════════════════════════════════════════════════════════
 def run(
   *,
   onnx_path: Path,
   task_id: str,
+  mode: str,
   source_kind: str,
   ort_provider: str,
   npz_clip: Optional[Path],
@@ -398,9 +442,6 @@ def run(
 ) -> None:
   spec = PolicySpec.from_onnx(onnx_path)
   spec.validate()
-  session, providers = _create_onnx_session(onnx_path, ort_provider)
-  input_name = session.get_inputs()[0].name
-  output_name = session.get_outputs()[0].name
 
   model, viewer_cfg, scene_physics_dt, scene_control_dt = _build_task_scene(task_id)
   if not np.isclose(scene_physics_dt, spec.physics_dt):
@@ -430,6 +471,18 @@ def run(
 
   reference = LiveReference(state, spec, joint_order, vel_smoothing=vel_smoothing)
   reference.wait_for_detection(timeout_s=15.0)
+
+  # ── Kinematic replay: write the mocap pose straight to qpos (no policy) ─────
+  if mode == "replay":
+    _run_kinematic_replay(
+      model, data, spec, reference, viewer_cfg, joint_qpos_adr, root_qpos_adr, source
+    )
+    return
+
+  # ── Policy teleoperation: bring up the ONNX session ────────────────────────
+  session, providers = _create_onnx_session(onnx_path, ort_provider)
+  input_name = session.get_inputs()[0].name
+  output_name = session.get_outputs()[0].name
 
   # ── Initialise the simulated robot at the first live pose ─────────────────
   initial_frame = reference.sample(0.0)
@@ -501,6 +554,12 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--onnx-path", type=Path, required=True)
   p.add_argument("--task-id", type=str, required=True)
   p.add_argument("--source", choices=("npz", "chingmu"), default="npz")
+  p.add_argument(
+    "--mode",
+    choices=("teleop", "replay"),
+    default="teleop",
+    help="teleop = policy in the loop; replay = kinematic full-body remap to qpos (no policy).",
+  )
   p.add_argument("--ort-provider", choices=("auto", "cpu", "cuda"), default="auto")
   p.add_argument("--vel-smoothing", type=float, default=0.0, help="EMA factor [0,1) for finite-diff velocities.")
   # NPZ mock
@@ -562,6 +621,7 @@ def main() -> None:
   run(
     onnx_path=args.onnx_path.expanduser().resolve(),
     task_id=str(args.task_id),
+    mode=str(args.mode),
     source_kind=str(args.source),
     ort_provider=str(args.ort_provider),
     npz_clip=args.npz_clip.expanduser().resolve() if args.npz_clip else None,
