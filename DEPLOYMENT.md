@@ -308,12 +308,16 @@ remains.
 uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mocap \
   --task-id Mjlab-YAHMP-Unitree-G1 --onnx-path assets/models/g1_yahmp.onnx \
   --source chingmu \
-  --chingmu-dll /path/to/libCMVrpn.so \
   --chingmu-host MCAvatar@192.168.123.112 \
   --sensor-root 0 --sensor-joint-first 1 \
   --joint-order config/chingmu_joint_order.json \
   --vel-smoothing 0.7
 ```
+
+The ChingMu VRPN library is **vendored** at
+[`third_party/chingmu/libCMVrpn.so`](third_party/chingmu/) and loaded by default
+— no absolute path needed. Override with `--chingmu-dll` only if you keep it
+elsewhere.
 
 The retargeting (human → G1 skeleton) is done **upstream in the ChingMu
 software**; the VRPN stream delivers a retargeted root pose + per-joint angles,
@@ -322,14 +326,25 @@ as a standard ChingMu VRPN client). Two configuration steps are **mandatory**:
 
 | Step | Why | How |
 |---|---|---|
-| **Joint-order map** | Mocap streams joints in its skeleton order; the policy expects `spec.joint_names` order. A wrong map silently drives the wrong joints. | Dump the policy order (below) + your ChingMu segment names, write a JSON list in stream order, pass `--joint-order`. |
+| **Joint-order map** | Mocap streams joints in its skeleton order; the policy expects `spec.joint_names` order. A wrong map silently drives the wrong joints. | Dump the policy order + your ChingMu segment order (both below), write a JSON list in stream order, pass `--joint-order`. |
 | **Frame calibration** | The command uses root height, roll/pitch and body-frame velocities; a mocap/world frame mismatch makes the policy track garbage. | Apply an offset/rotation to `root_pos` / `root_quat` in `ChingMuMocapSource._on_tracker`. |
 
-Print the policy's joint order to build the map:
+Print the policy's joint order:
 
 ```bash
 uv run python -c "import onnx; m=onnx.load('assets/models/g1_yahmp.onnx'); print({e.key:e.value for e in m.metadata_props}['joint_names'])"
 ```
+
+Dump your ChingMu skeleton's segment/sensor order (self-contained helper, uses
+the vendored library):
+
+```bash
+uv run python -m yahmp.scripts.deploy.chingmu_hierarchy --host MCAvatar@192.168.123.112
+```
+
+A starter [`config/chingmu_joint_order.json`](config/chingmu_joint_order.json)
+ships in identity order — reorder it to match the dump (see
+[`config/README.md`](config/README.md)).
 
 ### 5.3 Caveats
 

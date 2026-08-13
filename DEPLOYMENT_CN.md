@@ -294,12 +294,15 @@ uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mocap \
 uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mocap \
   --task-id Mjlab-YAHMP-Unitree-G1 --onnx-path assets/models/g1_yahmp.onnx \
   --source chingmu \
-  --chingmu-dll /path/to/libCMVrpn.so \
   --chingmu-host MCAvatar@192.168.123.112 \
   --sensor-root 0 --sensor-joint-first 1 \
   --joint-order config/chingmu_joint_order.json \
   --vel-smoothing 0.7
 ```
+
+ChingMu 的 VRPN 库已**随仓库自带**，位于
+[`third_party/chingmu/libCMVrpn.so`](third_party/chingmu/)，默认自动加载——无需
+绝对路径。只有当你把库放在别处时才需要用 `--chingmu-dll` 覆盖。
 
 重定向（人体 → G1 骨架）是在 **ChingMu 软件上游**完成的；VRPN 数据流直接给出
 重定向后的根位姿 + 各关节角度，数据源负责读取（与标准 ChingMu VRPN 客户端一致的
@@ -307,14 +310,24 @@ uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mocap \
 
 | 步骤 | 为什么 | 怎么做 |
 |---|---|---|
-| **关节顺序映射** | 动捕按其骨架顺序推送关节；策略要的是 `spec.joint_names` 顺序。映射错会悄无声息地控制到错误的关节。 | 打印策略关节顺序（见下）+ 你的 ChingMu 段名，按数据流顺序写成 JSON 列表，用 `--joint-order` 传入。 |
+| **关节顺序映射** | 动捕按其骨架顺序推送关节；策略要的是 `spec.joint_names` 顺序。映射错会悄无声息地控制到错误的关节。 | 打印策略关节顺序 + 你的 ChingMu 段顺序（下面两条命令），按数据流顺序写成 JSON 列表，用 `--joint-order` 传入。 |
 | **坐标系标定** | 指令用到根高度、roll/pitch 以及机体系速度；动捕/世界坐标系不一致会让策略跟踪到错误目标。 | 在 `ChingMuMocapSource._on_tracker` 里对 `root_pos` / `root_quat` 施加偏移/旋转。 |
 
-打印策略关节顺序以构建映射：
+打印策略关节顺序：
 
 ```bash
 uv run python -c "import onnx; m=onnx.load('assets/models/g1_yahmp.onnx'); print({e.key:e.value for e in m.metadata_props}['joint_names'])"
 ```
+
+导出你的 ChingMu 骨架段/传感器顺序（自带的独立小工具，使用仓库自带的库）：
+
+```bash
+uv run python -m yahmp.scripts.deploy.chingmu_hierarchy --host MCAvatar@192.168.123.112
+```
+
+仓库已附带一个 identity 顺序的
+[`config/chingmu_joint_order.json`](config/chingmu_joint_order.json) 模板——按上面
+的导出结果重新排序即可（见 [`config/README.md`](config/README.md)）。
 
 ### 5.3 注意事项
 

@@ -2,7 +2,7 @@
 
 Place motion assets here.
 
-By default, motion clips are loaded from the dataset referenced in [`motion_data_cfg.yaml`](/home/famadio/Workspace/RL/mjlab_playground/clamp/src/yahmp/config/g1/motion_data_cfg.yaml):
+By default, motion clips are loaded from the dataset referenced in [`motion_data_cfg.yaml`](../../src/yahmp/config/g1/motion_data_cfg.yaml):
 
 ```text
 assets/motions/g1_omomo_amass_clean

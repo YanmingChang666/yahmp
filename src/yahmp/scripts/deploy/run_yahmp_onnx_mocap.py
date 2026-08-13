@@ -28,12 +28,12 @@ Device-free test (no mocap hardware): stream an existing clip as if it were live
       --source npz \
       --npz-clip assets/motions/g1_omomo_amass_clean/<motion>.npz
 
-Live ChingMu teleoperation
+Live ChingMu teleoperation (VRPN library vendored at third_party/chingmu/,
+loaded by default; override with --chingmu-dll)
     uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mocap \
       --task-id Mjlab-YAHMP-Unitree-G1 \
       --onnx-path assets/models/g1_yahmp.onnx \
       --source chingmu \
-      --chingmu-dll /path/to/libCMVrpn.so \
       --chingmu-host MCAvatar@192.168.123.112 \
       --sensor-root 0 --sensor-joint-first 1 \
       --joint-order config/chingmu_joint_order.json
@@ -72,6 +72,11 @@ from yahmp.scripts.deploy.run_yahmp_onnx_mujoco import (
   _root_addresses,
   _term_values,
 )
+
+# Vendored ChingMu VRPN library (repo `third_party/chingmu/`). Resolved relative
+# to this file so it works from any CWD; override with `--chingmu-dll`.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_VENDORED_CHINGMU_DLL = _REPO_ROOT / "third_party" / "chingmu" / "libCMVrpn.so"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -501,7 +506,12 @@ def _build_argparser() -> argparse.ArgumentParser:
   # NPZ mock
   p.add_argument("--npz-clip", type=Path, default=None)
   # ChingMu
-  p.add_argument("--chingmu-dll", type=str, default=None, help="Path to libCMVrpn.so.")
+  p.add_argument(
+    "--chingmu-dll",
+    type=str,
+    default=None,
+    help="Path to libCMVrpn.so (default: vendored third_party/chingmu/libCMVrpn.so).",
+  )
   p.add_argument("--chingmu-host", type=str, default=None, help="e.g. MCAvatar@192.168.123.112")
   p.add_argument("--sensor-root", type=int, default=0)
   p.add_argument("--sensor-joint-first", type=int, default=1)
@@ -527,13 +537,21 @@ def main() -> None:
 
   chingmu_kwargs = {}
   if args.source == "chingmu":
-    if not args.chingmu_dll or not args.chingmu_host:
-      raise SystemExit("--source chingmu requires --chingmu-dll and --chingmu-host.")
+    if not args.chingmu_host:
+      raise SystemExit("--source chingmu requires --chingmu-host.")
+    dll_path = (
+      Path(args.chingmu_dll).expanduser() if args.chingmu_dll else _VENDORED_CHINGMU_DLL
+    )
+    if not dll_path.is_file():
+      raise SystemExit(
+        f"ChingMu DLL not found: {dll_path}. Pass --chingmu-dll or place it in "
+        "third_party/chingmu/libCMVrpn.so."
+      )
     num_joints = args.num_joints or (len(joint_order) if joint_order else None)
     if num_joints is None:
       raise SystemExit("Provide --num-joints or --joint-order for chingmu source.")
     chingmu_kwargs = dict(
-      dll_path=args.chingmu_dll,
+      dll_path=str(dll_path),
       host=args.chingmu_host,
       sensor_root=args.sensor_root,
       sensor_joint_first=args.sensor_joint_first,
