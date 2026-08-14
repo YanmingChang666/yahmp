@@ -47,7 +47,7 @@ import json
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -71,9 +71,31 @@ from yahmp.scripts.deploy.run_yahmp_onnx_mujoco import (
   _quat_conj,
   _quat_mul,
   _quat_normalize,
+  _quat_roll_pitch_yaw,
   _root_addresses,
   _term_values,
 )
+
+
+def _quat_from_euler(roll: float, pitch: float, yaw: float) -> np.ndarray:
+  """Roll/pitch/yaw (rad) → wxyz quaternion, inverse of `_quat_roll_pitch_yaw`.
+
+  Builds R = Rz(yaw)·Ry(pitch)·Rx(roll) so that feeding the result back through
+  `_quat_roll_pitch_yaw` returns the same angles — this makes the calibration's
+  root R/P/Y offset read back exactly on the command's root_roll/pitch.
+  """
+  cr, sr = np.cos(roll * 0.5), np.sin(roll * 0.5)
+  cp, sp = np.cos(pitch * 0.5), np.sin(pitch * 0.5)
+  cy, sy = np.cos(yaw * 0.5), np.sin(yaw * 0.5)
+  return np.array(
+    [
+      cr * cp * cy + sr * sp * sy,
+      sr * cp * cy - cr * sp * sy,
+      cr * sp * cy + sr * cp * sy,
+      cr * cp * sy - sr * sp * cy,
+    ],
+    dtype=np.float64,
+  )
 
 # Vendored ChingMu VRPN library (repo `third_party/chingmu/`). Resolved relative
 # to this file so it works from any CWD; override with `--chingmu-dll`.
@@ -165,10 +187,11 @@ class MocapCalibration:
     * joint bias   calibrated = raw − joint_offset
                    joint_offset = mean(neutral_joint) − default_joint_pos
                    (constant, so it does NOT perturb finite-differenced vels)
-    * root tilt    calibrated_quat = conj(root_quat_neutral) ⊗ raw_quat
-                   → neutral pelvis orientation becomes identity, so the command's
-                   root_roll / root_pitch ≈ 0 when the operator stands straight
-                   (also re-aligns neutral facing to robot +X).
+    * root tilt    calibrated_quat = rpy(root_rpy_offset) ⊗ conj(root_quat_neutral) ⊗ raw
+                   → neutral pelvis orientation becomes identity, then a constant
+                   world-frame R/P/Y correction is added on top. So the command's
+                   root_roll/pitch ≈ root_rpy_offset when the operator stands
+                   straight — dial it to remove a residual lean / facing error.
     * root height  calibrated_z = raw_z − root_height_neutral + root_height_target
 
   Assumes a **Z-up** mocap world (ChingMu default): the neutral inverse alone
@@ -179,6 +202,7 @@ class MocapCalibration:
   root_quat_neutral: np.ndarray   # (4,) wxyz
   root_height_neutral: float
   root_height_target: float
+  root_rpy_offset: np.ndarray = field(default_factory=lambda: np.zeros(3))  # (3,) rad
 
   @classmethod
   def load(cls, path: str | Path, spec: PolicySpec) -> "MocapCalibration":
@@ -201,6 +225,7 @@ class MocapCalibration:
       ),
       root_height_neutral=float(data.get("root_height_neutral", 0.0)),
       root_height_target=float(data.get("root_height_target", 0.0)),
+      root_rpy_offset=np.asarray(data.get("root_rpy_offset_rad", [0.0, 0.0, 0.0]), dtype=np.float64),
     )
 
   def apply(
@@ -209,8 +234,10 @@ class MocapCalibration:
     jp = joint_pos - self.joint_offset
     rp = root_pos.copy()
     rp[2] = rp[2] - self.root_height_neutral + self.root_height_target
-    rq = _quat_normalize(_quat_mul(_quat_conj(self.root_quat_neutral), _quat_normalize(root_quat)))
-    return jp, rp, rq
+    rq = _quat_mul(_quat_conj(self.root_quat_neutral), _quat_normalize(root_quat))
+    if np.any(self.root_rpy_offset):
+      rq = _quat_mul(_quat_from_euler(*self.root_rpy_offset), rq)
+    return jp, rp, _quat_normalize(rq)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -374,6 +401,7 @@ def capture_calibration(
     "root_quat_neutral_wxyz": [float(v) for v in q_mean],
     "root_height_neutral": float(z_mean),
     "root_height_target": float(height_target),
+    "root_rpy_offset_rad": [0.0, 0.0, 0.0],
     "captured_frames": int(frames),
   }
   out_path = Path(out_path)
@@ -598,6 +626,7 @@ class _InteractiveCalib:
     self.root_quat_neutral = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
     self.root_height_neutral = 0.0
     self.root_height_target = float(height_target)
+    self.root_rpy_offset = np.zeros(3, dtype=np.float64)  # [roll, pitch, yaw] rad
     self.enabled = True
     self.sel = 0
     self.step = np.deg2rad(2.0)
@@ -607,6 +636,7 @@ class _InteractiveCalib:
       self.root_quat_neutral = np.asarray(seed.root_quat_neutral, dtype=np.float64).copy()
       self.root_height_neutral = float(seed.root_height_neutral)
       self.root_height_target = float(seed.root_height_target)
+      self.root_rpy_offset = np.asarray(getattr(seed, "root_rpy_offset", np.zeros(3)), dtype=np.float64).copy()
       self.status = "seeded from existing calibration"
 
   def apply(self, joint_pos, root_pos, root_quat):
@@ -615,13 +645,16 @@ class _InteractiveCalib:
     jp = joint_pos - self.joint_offset
     rp = np.asarray(root_pos, dtype=np.float64).copy()
     rp[2] = rp[2] - self.root_height_neutral + self.root_height_target
-    rq = _quat_normalize(_quat_mul(_quat_conj(self.root_quat_neutral), _quat_normalize(root_quat)))
-    return jp, rp, rq
+    rq = _quat_mul(_quat_conj(self.root_quat_neutral), _quat_normalize(root_quat))
+    if np.any(self.root_rpy_offset):
+      rq = _quat_mul(_quat_from_euler(*self.root_rpy_offset), rq)
+    return jp, rp, _quat_normalize(rq)
 
   def capture_neutral(self, raw_joints, raw_root_pos, raw_root_quat):
     self.joint_offset = np.asarray(raw_joints, dtype=np.float64) - self.default
     self.root_quat_neutral = _quat_normalize(np.asarray(raw_root_quat, dtype=np.float64))
     self.root_height_neutral = float(raw_root_pos[2])
+    self.root_rpy_offset = np.zeros(3, dtype=np.float64)
     self.status = "captured neutral → offsets set so this pose == robot default"
 
   def zero_root(self, raw_root_quat):
@@ -651,6 +684,7 @@ class _InteractiveCalib:
       "root_quat_neutral_wxyz": [float(v) for v in self.root_quat_neutral],
       "root_height_neutral": float(self.root_height_neutral),
       "root_height_target": float(self.root_height_target),
+      "root_rpy_offset_rad": [float(v) for v in self.root_rpy_offset],
     }
 
   def render_panel(self, raw) -> str:
@@ -758,6 +792,139 @@ def _run_interactive_calibration(
       source.stop()
 
 
+def _run_gui_calibration(
+  model,
+  data,
+  spec: PolicySpec,
+  reference: "LiveReference",
+  viewer_cfg,
+  joint_qpos_adr: np.ndarray,
+  root_qpos_adr: int,
+  source,
+  *,
+  out_path: str,
+  height_target: float,
+  seed: Optional["MocapCalibration"],
+) -> None:
+  """Slider GUI (tkinter) to dial the root Roll/Pitch/Yaw + height, live in MuJoCo.
+
+  A single-thread design: tkinter's mainloop drives a ~50 Hz `after` tick that
+  samples the stream, applies the current calibration, and syncs the passive
+  viewer. Sliders adjust the world-frame root R/P/Y correction; "Capture Neutral"
+  sets the joint biases + zeroes the root so legs match the robot default.
+  """
+  import tkinter as tk
+
+  import mujoco.viewer as mujoco_viewer
+
+  calib = _InteractiveCalib(spec, height_target, seed=seed)
+  latest: dict = {"frame": None}
+
+  root = tk.Tk()
+  root.title("YAHMP mocap calibration — root R/P/Y")
+  roll_v = tk.DoubleVar(value=float(np.degrees(calib.root_rpy_offset[0])))
+  pitch_v = tk.DoubleVar(value=float(np.degrees(calib.root_rpy_offset[1])))
+  yaw_v = tk.DoubleVar(value=float(np.degrees(calib.root_rpy_offset[2])))
+  height_v = tk.DoubleVar(value=float(calib.root_height_target))
+  enabled_v = tk.BooleanVar(value=True)
+  status_v = tk.StringVar(value=calib.status)
+  readout_v = tk.StringVar(value="")
+
+  def _slider(label, var, lo, hi, res):
+    row = tk.Frame(root)
+    row.pack(fill="x", padx=8, pady=1)
+    tk.Label(row, text=label, width=9, anchor="w").pack(side="left")
+    tk.Scale(row, variable=var, from_=lo, to=hi, resolution=res, orient="horizontal", length=320).pack(
+      side="left", fill="x", expand=True
+    )
+
+  _slider("Roll °", roll_v, -30.0, 30.0, 0.5)
+  _slider("Pitch °", pitch_v, -30.0, 30.0, 0.5)
+  _slider("Yaw °", yaw_v, -60.0, 60.0, 0.5)
+  _slider("Height m", height_v, 0.50, 1.00, 0.005)
+
+  def _sync_from_sliders():
+    calib.root_rpy_offset = np.deg2rad([roll_v.get(), pitch_v.get(), yaw_v.get()])
+    calib.root_height_target = float(height_v.get())
+    calib.enabled = bool(enabled_v.get())
+
+  def _capture():
+    f = latest["frame"]
+    if f is not None:
+      calib.capture_neutral(f.joint_pos, f.root_pos_w, f.root_quat_w)
+      roll_v.set(0.0)
+      pitch_v.set(0.0)
+      yaw_v.set(0.0)
+      height_v.set(calib.root_height_target)
+      status_v.set(calib.status)
+
+  def _reset_rpy():
+    roll_v.set(0.0)
+    pitch_v.set(0.0)
+    yaw_v.set(0.0)
+    status_v.set("root R/P/Y reset to 0")
+
+  def _save():
+    _sync_from_sliders()
+    p = Path(out_path)
+    if p.parent and not p.parent.exists():
+      p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(calib.to_dict(), indent=2))
+    status_v.set(f"saved → {out_path}")
+
+  btns = tk.Frame(root)
+  btns.pack(fill="x", padx=8, pady=6)
+  tk.Button(btns, text="Capture Neutral (joints+root)", command=_capture).pack(side="left")
+  tk.Button(btns, text="Reset R/P/Y", command=_reset_rpy).pack(side="left", padx=4)
+  tk.Button(btns, text="Save", command=_save).pack(side="left", padx=4)
+  tk.Checkbutton(root, text="calibration enabled", variable=enabled_v).pack(anchor="w", padx=8)
+  tk.Label(root, textvariable=readout_v, anchor="w", justify="left", font=("TkFixedFont", 10)).pack(
+    fill="x", padx=8
+  )
+  tk.Label(root, textvariable=status_v, anchor="w", fg="#0a5").pack(fill="x", padx=8, pady=4)
+
+  viewer = mujoco_viewer.launch_passive(model, data)
+  _configure_camera(viewer, model, spec.root_body_name, viewer_cfg)
+  print("[Calibrate] GUI open. Stand NEUTRAL → Capture Neutral, then dial Roll/Pitch/Yaw. Save when happy.")
+
+  def _tick():
+    if not viewer.is_running():
+      root.destroy()
+      return
+    _sync_from_sliders()
+    frame = reference.sample(0.0)  # raw (reference is uncalibrated in this mode)
+    latest["frame"] = frame
+    jp, rp, rq = calib.apply(frame.joint_pos, frame.root_pos_w, frame.root_quat_w)
+    data.qpos[root_qpos_adr : root_qpos_adr + 3] = rp
+    data.qpos[root_qpos_adr + 3 : root_qpos_adr + 7] = rq
+    data.qpos[joint_qpos_adr] = jp
+    data.qvel[:] = 0.0
+    mujoco.mj_forward(model, data)
+    viewer.sync()
+    er, ep, ey = np.degrees(_quat_roll_pitch_yaw(rq))
+    readout_v.set(
+      f"command root:  roll={er:+6.1f}°  pitch={ep:+6.1f}°  yaw={ey:+6.1f}°   height={rp[2]:.3f} m"
+    )
+    root.after(20, _tick)
+
+  def _on_close():
+    try:
+      viewer.close()
+    finally:
+      root.destroy()
+
+  root.protocol("WM_DELETE_WINDOW", _on_close)
+  root.after(0, _tick)
+  try:
+    root.mainloop()
+  finally:
+    try:
+      viewer.close()
+    except Exception:  # noqa: BLE001 - viewer may already be closed
+      pass
+    source.stop()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Main loop
 # ══════════════════════════════════════════════════════════════════════════════
@@ -821,14 +988,28 @@ def run(
   )
   reference.wait_for_detection(timeout_s=15.0)
 
-  # ── Interactive calibration: tune offsets live in the viewer, save JSON ─────
+  # ── Interactive calibration: tune root R/P/Y live in the viewer, save JSON ──
   if mode == "calibrate":
     if not mocap_calibration:
       raise SystemExit("--mode calibrate requires --mocap-calibration <path to save/load>.")
-    _run_interactive_calibration(
-      model, data, spec, reference, viewer_cfg, joint_qpos_adr, root_qpos_adr, source,
-      out_path=mocap_calibration, height_target=calibrate_height_target, seed=calibration,
+    calib_args = (model, data, spec, reference, viewer_cfg, joint_qpos_adr, root_qpos_adr, source)
+    calib_kwargs = dict(
+      out_path=mocap_calibration, height_target=calibrate_height_target, seed=calibration
     )
+    have_gui = True
+    try:  # probe both the import and a usable display before committing
+      import tkinter as _tk
+
+      _probe = _tk.Tk()
+      _probe.withdraw()
+      _probe.destroy()
+    except Exception as exc:  # noqa: BLE001 - ImportError or TclError (no $DISPLAY)
+      have_gui = False
+      print(f"[Calibrate] slider GUI unavailable ({exc}); using keyboard/terminal mode.")
+    if have_gui:
+      _run_gui_calibration(*calib_args, **calib_kwargs)
+    else:
+      _run_interactive_calibration(*calib_args, **calib_kwargs)
     return
 
   # ── Kinematic replay: write the mocap pose straight to qpos (no policy) ─────
