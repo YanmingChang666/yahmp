@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -576,6 +577,188 @@ def _run_kinematic_replay(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Interactive calibration (kinematic viewer + live terminal panel, no policy)
+# ══════════════════════════════════════════════════════════════════════════════
+class _InteractiveCalib:
+  """Mutable calibration state edited live from the viewer's key callback.
+
+  The MuJoCo window is driven kinematically by the *calibrated* pose, so you see
+  the effect instantly; the terminal panel shows per-joint raw / offset /
+  calibrated / default angles. `apply()` mirrors `MocapCalibration.apply` but can
+  be toggled off to compare against the raw stream.
+  """
+
+  KEYS = "[N]capture  [C]toggle  [ [ / ] ]select  [ - / = ]nudge  [0]zero  [R]root  [S]save  [P]print"
+
+  def __init__(self, spec: PolicySpec, height_target: float, seed: Optional["MocapCalibration"] = None):
+    self.names = list(spec.joint_names)
+    self.n = len(self.names)
+    self.default = np.asarray(spec.default_joint_pos, dtype=np.float64)
+    self.joint_offset = np.zeros(self.n, dtype=np.float64)
+    self.root_quat_neutral = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    self.root_height_neutral = 0.0
+    self.root_height_target = float(height_target)
+    self.enabled = True
+    self.sel = 0
+    self.step = np.deg2rad(2.0)
+    self.status = "ready — stand NEUTRAL and press N"
+    if seed is not None:
+      self.joint_offset = np.asarray(seed.joint_offset, dtype=np.float64).copy()
+      self.root_quat_neutral = np.asarray(seed.root_quat_neutral, dtype=np.float64).copy()
+      self.root_height_neutral = float(seed.root_height_neutral)
+      self.root_height_target = float(seed.root_height_target)
+      self.status = "seeded from existing calibration"
+
+  def apply(self, joint_pos, root_pos, root_quat):
+    if not self.enabled:
+      return joint_pos, root_pos, root_quat
+    jp = joint_pos - self.joint_offset
+    rp = np.asarray(root_pos, dtype=np.float64).copy()
+    rp[2] = rp[2] - self.root_height_neutral + self.root_height_target
+    rq = _quat_normalize(_quat_mul(_quat_conj(self.root_quat_neutral), _quat_normalize(root_quat)))
+    return jp, rp, rq
+
+  def capture_neutral(self, raw_joints, raw_root_pos, raw_root_quat):
+    self.joint_offset = np.asarray(raw_joints, dtype=np.float64) - self.default
+    self.root_quat_neutral = _quat_normalize(np.asarray(raw_root_quat, dtype=np.float64))
+    self.root_height_neutral = float(raw_root_pos[2])
+    self.status = "captured neutral → offsets set so this pose == robot default"
+
+  def zero_root(self, raw_root_quat):
+    self.root_quat_neutral = _quat_normalize(np.asarray(raw_root_quat, dtype=np.float64))
+    self.status = "root orientation re-zeroed to current pose"
+
+  def select(self, d):
+    self.sel = (self.sel + int(d)) % self.n
+    self.status = f"selected {self.names[self.sel]}"
+
+  def nudge(self, d):
+    self.joint_offset[self.sel] += float(d) * self.step
+    self.status = f"{self.names[self.sel]} offset = {np.degrees(self.joint_offset[self.sel]):+.1f}°"
+
+  def zero_selected(self):
+    self.joint_offset[self.sel] = 0.0
+    self.status = f"{self.names[self.sel]} offset zeroed"
+
+  def to_dict(self):
+    return {
+      "_comment": (
+        "Interactive neutral-pose mocap calibration (Z-up). calibrated = raw - "
+        "joint_offset; root zeroed via conj(root_quat_neutral); height retargeted."
+      ),
+      "joint_names": list(self.names),
+      "joint_offset_rad": [float(v) for v in self.joint_offset],
+      "root_quat_neutral_wxyz": [float(v) for v in self.root_quat_neutral],
+      "root_height_neutral": float(self.root_height_neutral),
+      "root_height_target": float(self.root_height_target),
+    }
+
+  def render_panel(self, raw) -> str:
+    raw = np.zeros(self.n) if raw is None else np.asarray(raw, dtype=np.float64)
+    cal = raw - self.joint_offset
+    hdr = [
+      "YAHMP mocap calibration  —  kinematic viewer (no policy)",
+      f"  calibration: {'ON ' if self.enabled else 'OFF'}   "
+      f"height_target={self.root_height_target:.3f}m   neutral_z={self.root_height_neutral:.3f}m",
+      f"  {self.KEYS}",
+      f"  {'sel':>3} {'joint':>24} {'raw°':>8} {'off°':>8} {'cal°':>8} {'def°':>8}",
+      "  " + "─" * 63,
+    ]
+    body = [
+      f"  {'>>' if i == self.sel else '':>3} {name:>24} "
+      f"{np.degrees(raw[i]):>8.1f} {np.degrees(self.joint_offset[i]):>8.1f} "
+      f"{np.degrees(cal[i]):>8.1f} {np.degrees(self.default[i]):>8.1f}"
+      for i, name in enumerate(self.names)
+    ]
+    return "\n".join(hdr + body + [f"  status: {self.status}"])
+
+
+def _run_interactive_calibration(
+  model,
+  data,
+  spec: PolicySpec,
+  reference: "LiveReference",
+  viewer_cfg,
+  joint_qpos_adr: np.ndarray,
+  root_qpos_adr: int,
+  source,
+  *,
+  out_path: str,
+  height_target: float,
+  seed: Optional["MocapCalibration"],
+) -> None:
+  """Live kinematic calibration: adjust offsets in the viewer, save a JSON.
+
+  `reference` must be **uncalibrated** — calibration is applied here so it can be
+  toggled on/off for comparison. Nothing is energized; this only writes qpos.
+  """
+  import mujoco.viewer as mujoco_viewer
+
+  calib = _InteractiveCalib(spec, height_target, seed=seed)
+  latest: dict = {"frame": None, "raw": None}
+
+  def save() -> None:
+    p = Path(out_path)
+    if p.parent and not p.parent.exists():
+      p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(calib.to_dict(), indent=2))
+    calib.status = f"saved → {out_path}"
+
+  def key_callback(key: int) -> None:
+    ch = chr(key) if 0 <= key < 256 else ""
+    f = latest["frame"]
+    if ch == "N" and f is not None:
+      calib.capture_neutral(f.joint_pos, f.root_pos_w, f.root_quat_w)
+    elif ch == "C":
+      calib.enabled = not calib.enabled
+      calib.status = f"calibration {'ON' if calib.enabled else 'OFF'}"
+    elif ch == "]":
+      calib.select(+1)
+    elif ch == "[":
+      calib.select(-1)
+    elif ch in ("=", "+"):
+      calib.nudge(+1)
+    elif ch in ("-", "_"):
+      calib.nudge(-1)
+    elif ch == "0":
+      calib.zero_selected()
+    elif ch == "R" and f is not None:
+      calib.zero_root(f.root_quat_w)
+    elif ch == "S":
+      save()
+    elif ch == "P":
+      print("\n" + json.dumps(calib.to_dict(), indent=2))
+
+  print(
+    "[Calibrate] interactive kinematic calibration. Stand NEUTRAL, press N, then "
+    "move to check tracking. Keys:\n            " + _InteractiveCalib.KEYS
+  )
+  with mujoco_viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
+    _configure_camera(viewer, model, spec.root_body_name, viewer_cfg)
+    last_panel = 0.0
+    try:
+      while viewer.is_running():
+        t0 = time.perf_counter()
+        frame = reference.sample(0.0)  # raw (reference is uncalibrated in this mode)
+        latest["frame"] = frame
+        latest["raw"] = frame.joint_pos
+        jp, rp, rq = calib.apply(frame.joint_pos, frame.root_pos_w, frame.root_quat_w)
+        data.qpos[root_qpos_adr : root_qpos_adr + 3] = rp
+        data.qpos[root_qpos_adr + 3 : root_qpos_adr + 7] = rq
+        data.qpos[joint_qpos_adr] = jp
+        data.qvel[:] = 0.0
+        mujoco.mj_forward(model, data)
+        viewer.sync()
+        if t0 - last_panel > 0.2:  # refresh the terminal panel ~5 Hz
+          sys.stdout.write("\x1b[2J\x1b[H" + calib.render_panel(latest["raw"]) + "\n")
+          sys.stdout.flush()
+          last_panel = t0
+        time.sleep(max(0.0, 0.02 - (time.perf_counter() - t0)))  # ~50 Hz
+    finally:
+      source.stop()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main loop
 # ══════════════════════════════════════════════════════════════════════════════
 def run(
@@ -590,6 +773,7 @@ def run(
   joint_order: Optional[list[str]],
   vel_smoothing: float,
   mocap_calibration: str = "",
+  calibrate_height_target: float = 0.793,
 ) -> None:
   spec = PolicySpec.from_onnx(onnx_path)
   spec.validate()
@@ -620,13 +804,32 @@ def run(
     raise ValueError(f"Unknown --source {source_kind!r}.")
   source.start()
 
-  calibration = MocapCalibration.load(mocap_calibration, spec) if mocap_calibration else None
+  seed_exists = bool(mocap_calibration) and Path(mocap_calibration).is_file()
+  calibration = MocapCalibration.load(mocap_calibration, spec) if seed_exists else None
   if calibration is not None:
     print(f"[INFO] mocap calibration loaded from {mocap_calibration}")
+  elif mocap_calibration and mode != "calibrate":
+    raise SystemExit(f"--mocap-calibration file not found: {mocap_calibration}")
+  # In calibrate mode the tool applies calibration itself (toggleable), so the
+  # reference must stay raw; replay/teleop bake it into the reference.
   reference = LiveReference(
-    state, spec, joint_order, vel_smoothing=vel_smoothing, calibration=calibration
+    state,
+    spec,
+    joint_order,
+    vel_smoothing=vel_smoothing,
+    calibration=(None if mode == "calibrate" else calibration),
   )
   reference.wait_for_detection(timeout_s=15.0)
+
+  # ── Interactive calibration: tune offsets live in the viewer, save JSON ─────
+  if mode == "calibrate":
+    if not mocap_calibration:
+      raise SystemExit("--mode calibrate requires --mocap-calibration <path to save/load>.")
+    _run_interactive_calibration(
+      model, data, spec, reference, viewer_cfg, joint_qpos_adr, root_qpos_adr, source,
+      out_path=mocap_calibration, height_target=calibrate_height_target, seed=calibration,
+    )
+    return
 
   # ── Kinematic replay: write the mocap pose straight to qpos (no policy) ─────
   if mode == "replay":
@@ -719,13 +922,15 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--source", choices=("npz", "chingmu"), default="npz")
   p.add_argument(
     "--mode",
-    choices=("teleop", "replay"),
+    choices=("teleop", "replay", "calibrate"),
     default="teleop",
-    help="teleop = policy in the loop; replay = kinematic full-body remap to qpos (no policy).",
+    help="teleop = policy in the loop; replay = kinematic full-body remap to qpos (no policy); "
+    "calibrate = interactive kinematic tool to build a --mocap-calibration JSON.",
   )
   p.add_argument("--ort-provider", choices=("auto", "cpu", "cuda"), default="auto")
   p.add_argument("--vel-smoothing", type=float, default=0.0, help="EMA factor [0,1) for finite-diff velocities.")
-  p.add_argument("--mocap-calibration", type=str, default="", help="Path to a neutral-pose calibration JSON (captured on the real robot via --calibrate) to apply to the live command.")
+  p.add_argument("--mocap-calibration", type=str, default="", help="Neutral-pose calibration JSON to apply (teleop/replay) or build/save (--mode calibrate).")
+  p.add_argument("--calibrate-height-target", type=float, default=0.793, help="Nominal pelvis height (m) neutral maps to in --mode calibrate. G1 default ~0.793.")
   # NPZ mock
   p.add_argument("--npz-clip", type=Path, default=None)
   # ChingMu
@@ -793,6 +998,7 @@ def main() -> None:
     joint_order=joint_order,
     vel_smoothing=float(args.vel_smoothing),
     mocap_calibration=str(args.mocap_calibration),
+    calibrate_height_target=float(args.calibrate_height_target),
   )
 
 
