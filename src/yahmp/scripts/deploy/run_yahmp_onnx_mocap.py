@@ -589,6 +589,7 @@ def run(
   chingmu_kwargs: dict,
   joint_order: Optional[list[str]],
   vel_smoothing: float,
+  mocap_calibration: str = "",
 ) -> None:
   spec = PolicySpec.from_onnx(onnx_path)
   spec.validate()
@@ -619,7 +620,12 @@ def run(
     raise ValueError(f"Unknown --source {source_kind!r}.")
   source.start()
 
-  reference = LiveReference(state, spec, joint_order, vel_smoothing=vel_smoothing)
+  calibration = MocapCalibration.load(mocap_calibration, spec) if mocap_calibration else None
+  if calibration is not None:
+    print(f"[INFO] mocap calibration loaded from {mocap_calibration}")
+  reference = LiveReference(
+    state, spec, joint_order, vel_smoothing=vel_smoothing, calibration=calibration
+  )
   reference.wait_for_detection(timeout_s=15.0)
 
   # ── Kinematic replay: write the mocap pose straight to qpos (no policy) ─────
@@ -719,6 +725,7 @@ def _build_argparser() -> argparse.ArgumentParser:
   )
   p.add_argument("--ort-provider", choices=("auto", "cpu", "cuda"), default="auto")
   p.add_argument("--vel-smoothing", type=float, default=0.0, help="EMA factor [0,1) for finite-diff velocities.")
+  p.add_argument("--mocap-calibration", type=str, default="", help="Path to a neutral-pose calibration JSON (captured on the real robot via --calibrate) to apply to the live command.")
   # NPZ mock
   p.add_argument("--npz-clip", type=Path, default=None)
   # ChingMu
@@ -785,6 +792,7 @@ def main() -> None:
     chingmu_kwargs=chingmu_kwargs,
     joint_order=joint_order,
     vel_smoothing=float(args.vel_smoothing),
+    mocap_calibration=str(args.mocap_calibration),
   )
 
 
