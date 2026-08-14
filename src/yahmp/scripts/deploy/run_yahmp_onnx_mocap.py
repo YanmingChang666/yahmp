@@ -226,13 +226,16 @@ class LiveReference:
       joint_vel, root_lin_vel, root_ang_vel = self._vel_jp, self._vel_lin, self._vel_ang
 
     self._prev = (now, joint_pos.copy(), root_pos.copy(), root_quat.copy())
+    # MotionFrame feeds the policy's `command` term (dim 2N+6 = 64 for g1_yahmp):
+    #   joint_pos/joint_vel -> ref joint angles/vels (N=29 each)
+    #   root_* -> anchor planar vel (2), yaw rate (1), height (1), roll/pitch (2)
     return MotionFrame(
-      joint_pos=joint_pos.astype(np.float64),
-      joint_vel=np.asarray(joint_vel, dtype=np.float64),
-      root_pos_w=root_pos.astype(np.float64),
-      root_quat_w=root_quat.astype(np.float64),
-      root_lin_vel_w=np.asarray(root_lin_vel, dtype=np.float64),
-      root_ang_vel_w=np.asarray(root_ang_vel, dtype=np.float64),
+      joint_pos=joint_pos.astype(np.float64),          # (N,)  = 29
+      joint_vel=np.asarray(joint_vel, dtype=np.float64),      # (N,)  = 29
+      root_pos_w=root_pos.astype(np.float64),          # (3,)  world position (only z=height used)
+      root_quat_w=root_quat.astype(np.float64),        # (4,)  wxyz (roll/pitch + frame for vels)
+      root_lin_vel_w=np.asarray(root_lin_vel, dtype=np.float64),  # (3,)  world lin vel (xy used)
+      root_ang_vel_w=np.asarray(root_ang_vel, dtype=np.float64),  # (3,)  world ang vel (yaw used)
     )
 
   # NOTE: the Future variant (`Mjlab-YAHMP-Future-Unitree-G1`) asks for frames at
@@ -517,16 +520,23 @@ def run(
       while viewer.is_running():
         wall_t0 = time.perf_counter()
 
-        frame = reference.sample(0.0)  # latest mocap pose
-        terms = _term_values(
+        # OBSERVATION DIMS (g1_yahmp, num_joints N=29) — total obs = 1727:
+        #   command 64 (=2N+6) + base_ang_vel 3 + projected_gravity 3 +
+        #   joint_pos N + joint_vel N + actions N(=action_dim) + history 1570
+        #   history 1570 = 10 frames × 157-dim block
+        #     (block = command 64 + base_ang_vel 3 + proj_gravity 3 + joint_pos N + joint_vel N + actions N)
+        #   command 64 = joint_pos_ref N | joint_vel_ref N | anchor_lin_vel_xy 2 |
+        #                anchor_ang_vel_yaw 1 | root_height 1 | root_roll,pitch 2
+        frame = reference.sample(0.0)  # latest mocap pose -> MotionFrame (see LiveReference.sample)
+        terms = _term_values(  # dict of the 6 current terms above (robot state from sim + command from mocap)
           model, data, spec, reference, 0.0, frame,
           joint_qpos_adr, joint_qvel_adr, previous_action,
         )
-        obs = _build_observation(spec, terms, history)
+        obs = _build_observation(spec, terms, history)  # (1727,) — concatenated in spec.observation_terms order
         raw_action = (
           session.run([output_name], {input_name: obs[None, :].astype(np.float32)})[0]
           .reshape(-1)
-          .astype(np.float32)
+          .astype(np.float32)  # (29,) = action_dim
         )
 
         _apply_action(

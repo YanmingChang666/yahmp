@@ -54,6 +54,7 @@ from yahmp.scripts.deploy.run_yahmp_onnx_mocap import (
   MocapState,
   NpzMockSource,
 )
+from yahmp.scripts.deploy.run_yahmp_onnx_recorder import Sim2RealRecorder
 from yahmp.scripts.deploy.run_yahmp_onnx_mujoco import (
   PolicySpec,
   _append_history,
@@ -253,24 +254,56 @@ class G1Controller:
 # Observation (real state + live command) — reuses YAHMP's assembly verbatim
 # ══════════════════════════════════════════════════════════════════════════════
 def _real_terms(spec, reference, frame, qj, dqj, quat, gyro, default_joint_pos, prev_action):
+  """Build the per-step observation terms from real robot state + live command.
+
+  OBSERVATION LAYOUT — dims below are for the shipped `g1_yahmp.onnx`
+  (num_joints N = 29). The code reads the true sizes from the ONNX metadata, so
+  it adapts automatically if you re-export a different policy.
+
+    term                dim    source
+    ─────────────────── ────── ───────────────────────────────────────────────
+    command               64    motion reference = 2N + 6  (breakdown below)
+    base_ang_vel           3    IMU gyroscope, body frame
+    projected_gravity      3    gravity rotated into body frame (from IMU quat)
+    joint_pos             29    encoder q − default_joint_pos            (= N)
+    joint_vel             29    encoder dq                               (= N)
+    actions               29    previous policy output      (= action_dim = N)
+    history             1570    last 10 frames × 157-dim block (10 × 157)
+    ─────────────────── ────── ───────────────────────────────────────────────
+    TOTAL               1727    == spec.observation_dim
+
+    command (64) = joint_pos_ref 29 | joint_vel_ref 29 | anchor_lin_vel_xy 2 |
+                   anchor_ang_vel_yaw 1 | root_height 1 | root_roll,pitch 2
+    history block (157) = command 64 + base_ang_vel 3 + projected_gravity 3 +
+                   joint_pos 29 + joint_vel 29 + actions 29   (buffered 10 deep)
+
+  The `history` term is assembled from these six terms inside
+  `_build_observation()`; this function only produces the six current terms.
+  """
   if any(t.name == "base_lin_vel" for t in spec.observation_terms):
     raise NotImplementedError(
       "This policy's observation includes `base_lin_vel` (privileged/teacher). "
       "It is not deployable on hardware without a base-velocity estimator."
     )
   return {
-    "command": _command_value(spec, reference, 0.0, frame),
-    "base_ang_vel": gyro.astype(np.float32),
-    "projected_gravity": _quat_rotate_inverse(quat, _GRAVITY_W).astype(np.float32),
-    "joint_pos": (qj - default_joint_pos).astype(np.float32),
-    "joint_vel": dqj.astype(np.float32),
-    "actions": prev_action.astype(np.float32),
+    "command": _command_value(spec, reference, 0.0, frame),                          # (64,)  = 2N + 6
+    "base_ang_vel": gyro.astype(np.float32),                                         # (3,)
+    "projected_gravity": _quat_rotate_inverse(quat, _GRAVITY_W).astype(np.float32),  # (3,)
+    "joint_pos": (qj - default_joint_pos).astype(np.float32),                        # (29,) = N
+    "joint_vel": dqj.astype(np.float32),                                             # (29,) = N
+    "actions": prev_action.astype(np.float32),                                       # (29,) = action_dim
   }
 
 
 def _decode_targets(spec, raw_action, frame, default_joint_pos, action_target_joint_indices):
-  processed = raw_action.astype(np.float64) * spec.action_scale + spec.action_offset
-  target = default_joint_pos.copy()
+  """Policy action → per-joint position targets (in joint_names / motor order).
+
+  Dims (g1_yahmp): raw_action (29,) = action_dim; processed (29,); target (29,) = N.
+  Residual semantics add the mocap reference joint angles; the result is the `q`
+  setpoint sent to each motor (with Kp/Kd) in the control loop.
+  """
+  processed = raw_action.astype(np.float64) * spec.action_scale + spec.action_offset  # (29,)
+  target = default_joint_pos.copy()                                                    # (29,) = N
   if spec.action_semantics == "residual_joint_position":
     target[action_target_joint_indices] = frame.joint_pos[action_target_joint_indices] + processed
   else:
@@ -297,6 +330,8 @@ def run(
   lowcmd_topic: str,
   lowstate_topic: str,
   dry_run: bool,
+  record: str = "",
+  record_steps: int = 0,
 ) -> None:
   spec = PolicySpec.from_onnx(onnx_path)
   spec.validate()
@@ -356,23 +391,46 @@ def run(
   terms = _real_terms(spec, reference, frame, qj, dqj, quat, gyro, default_joint_pos, prev_action)
   history = _initialize_history(spec, terms)
 
+  # ── Sim2real data recorder (optional; --record) ─────────────────────────────
+  recorder = (
+    Sim2RealRecorder(
+      record,
+      spec.joint_names,
+      action_target_names=spec.action_target_names,
+      meta=dict(
+        onnx_path=str(onnx_path),
+        source=source_kind,
+        kp_scale=kp_scale,
+        kd_scale=kd_scale,
+        dry_run=dry_run,
+        control_dt=spec.control_dt,
+        action_semantics=spec.action_semantics,
+      ),
+    )
+    if record
+    else None
+  )
+
   # ── Control loop ───────────────────────────────────────────────────────────
   print("[G1] policy running. Press SELECT to stop (→ damping).")
+  prev_loop_start: Optional[float] = None
   try:
     while robot.remote.button[KeyMap.select] != 1:
       t0 = time.perf_counter()
 
-      qj, dqj = robot.read_joint_state()
-      quat, gyro = robot.read_imu()
-      frame = reference.sample(0.0)
+      qj, dqj = robot.read_joint_state()   # each (29,) = N, in joint_names/motor order
+      quat, gyro = robot.read_imu()        # quat (4,) wxyz, gyro (3,)
+      frame = reference.sample(0.0)        # MotionFrame: joint_pos/vel (29,), root pose/vel
       terms = _real_terms(spec, reference, frame, qj, dqj, quat, gyro, default_joint_pos, prev_action)
-      obs = _build_observation(spec, terms, history)
+      obs = _build_observation(spec, terms, history)  # (1727,) for g1_yahmp = 6 terms + history(1570)
 
+      t_infer0 = time.perf_counter()
       raw_action = (
         session.run([output_name], {input_name: obs[None, :].astype(np.float32)})[0]
         .reshape(-1)
-        .astype(np.float32)
+        .astype(np.float32)  # (29,) = action_dim
       )
+      infer_ms = (time.perf_counter() - t_infer0) * 1e3
       target = _decode_targets(spec, raw_action, frame, default_joint_pos, action_target_joint_indices)
       robot.send_targets(target, kp_scale, kd_scale)
 
@@ -382,12 +440,39 @@ def run(
       dt = time.perf_counter() - t0
       if dt > 1.5 * spec.control_dt:
         print(f"[warn] control loop overrun: {dt * 1e3:.1f} ms > {spec.control_dt * 1e3:.1f} ms")
+
+      if recorder is not None:
+        recorder.step(
+          wall_time=t0,
+          ref_joint_pos=frame.joint_pos,
+          target_joint_pos=target,
+          actual_joint_pos=qj,
+          actual_joint_vel=dqj,
+          quat=quat,
+          ang_vel=gyro,
+          proj_grav=terms["projected_gravity"],
+          raw_action=raw_action,
+          timing=dict(
+            infer_ms=infer_ms,
+            step_ms=dt * 1e3,
+            period_ms=(t0 - prev_loop_start) * 1e3 if prev_loop_start is not None else float("nan"),
+            overrun=dt > spec.control_dt,
+          ),
+        )
+        if record_steps > 0 and recorder.count >= record_steps:
+          print("[Recorder] reached --record-steps limit, stopping recording.")
+          recorder.close()
+          recorder = None
+      prev_loop_start = t0
+
       time.sleep(max(0.0, spec.control_dt - dt))
   except KeyboardInterrupt:
     pass
   finally:
     robot.damping_stop()
     source.stop()
+    if recorder is not None and recorder.count > 0:
+      recorder.close()
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -400,6 +485,8 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--kp-scale", type=float, default=1.0, help="Scale trained Kp (start small, e.g. 0.25).")
   p.add_argument("--kd-scale", type=float, default=1.0, help="Scale trained Kd (start small, e.g. 0.5).")
   p.add_argument("--dry-run", action="store_true", help="Run the full loop but keep motors limp (kp=kd=0).")
+  p.add_argument("--record", type=str, default="", help="Sim2real CSV recording prefix, empty = off. e.g. --record ./sim2real_data/run")
+  p.add_argument("--record-steps", type=int, default=0, help="Max steps to record (0 = unlimited).")
   p.add_argument("--lowcmd-topic", type=str, default="rt/lowcmd")
   p.add_argument("--lowstate-topic", type=str, default="rt/lowstate")
   p.add_argument("--joint2motor", type=Path, default=None, help="JSON list mapping joint index -> motor index (default: identity).")
@@ -465,6 +552,8 @@ def main() -> None:
     lowcmd_topic=str(args.lowcmd_topic),
     lowstate_topic=str(args.lowstate_topic),
     dry_run=bool(args.dry_run),
+    record=str(args.record),
+    record_steps=int(args.record_steps),
   )
 
 
