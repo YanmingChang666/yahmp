@@ -8,3 +8,4 @@ logs/
 *.csv
 wandb/
 assets/logs/
+sim2real_data/
