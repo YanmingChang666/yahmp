@@ -400,7 +400,8 @@ uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_real \
 ```
 
 确认无误后去掉 `--dry-run`，并随信心增加把 `--kp-scale` / `--kd-scale` 逐步升到
-`1.0`。`--net` 是你的 DDS 网卡（用 `ip a` 查看）。
+`1.0`。`--net` 是你的 DDS 网卡（用 `ip a` 查看）。如果升增益的过程中机器人出现
+高频抖动或“嗡嗡”振荡，先启用**目标平滑**（5.5 节）再继续加大增益。
 
 | 要点 | 说明 |
 |---|---|
@@ -408,6 +409,51 @@ uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_real \
 | **无需关节重排** | G1 电机顺序**等于** YAHMP 的 `joint_names`（腿→腰→臂）；仅当你的机器人不同才用 `--joint2motor` 覆盖。 |
 | **IMU = 骨盆** | YAHMP 的根是骨盆，因此直接使用骨盆 IMU（无需 torso 变换）。若你的 IMU 在 torso，请先变换到骨盆系。 |
 | **先在仿真验证** | 上电前先用同一 ONNX 跑 `--source npz`（5.1 节）和运动学回放（5.2 节）。 |
+
+### 5.5 目标平滑——打破 sim2real 极限环
+
+一个在 MuJoCo 里稳定的策略，上真机后仍可能陷入**高频极限环**：原始动作发生
+抖振（约 8–9 Hz 的振荡），电机根本跟不上，机身不是站稳而是在抖。根源是
+sim2real 差距——真实的执行 / 传感 / DDS 延迟在训练中没有被充分建模——在满增益
+下被进一步放大。
+
+典型特征可从 `--record` 日志（5.4 节）看出：**动捕指令是平滑的**（约
+0.1°/步），而**策略目标在抖振**（每步好几度，约 15 次/秒来回反向），同时机身
+陀螺仪 RMS ≫ 0.1 rad/s。用录制器的 `analyze` 可以逐关节看到：
+
+```bash
+uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_recorder analyze ./sim2real_data/run_*_full.csv
+```
+
+`run_yahmp_onnx_real.py` 可以对**下发的目标**做滤波来打破这个极限环。它只平滑
+真正送给电机的目标——喂回策略的观测保持不变，从而保证 sim/real 观测一致。
+
+| 参数 | 作用 |
+|---|---|
+| `--target-ema α` | 对目标做指数滑动平均：`y = α·target + (1−α)·y_prev`。`α` 是新样本的权重，取值 `(0,1]`。`1.0` = 关闭（默认）；越小平滑越强（滞后也越大）。建议从 `0.3` 起步。 |
+| `--target-max-rate R` | 逐关节的硬性变化率上限：`\|Δtarget\| ≤ R·control_dt`（rad/s）。`0` = 关闭（默认）。`6.0` 在 50 Hz 下 ≈ 6.9°/步——独立于 EMA 的安全钳制。 |
+
+两者都以保持中的默认姿态作为初值，因此第一帧下发的目标从当前姿态出发、不会
+跳变。推荐：把平滑与安全指引里的小增益结合使用，并加 `--record` 以便对比：
+
+```bash
+uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_real \
+  --onnx-path assets/models/g1_yahmp.onnx --net enp4s0 \
+  --source chingmu --chingmu-host MCAvatar@192.168.123.112:3884 \
+  --sensor-root 301 --sensor-joint-first 302 \
+  --joint-order config/chingmu_joint_order.json \
+  --kp-scale 0.25 --kd-scale 0.75 \
+  --target-ema 0.3 --target-max-rate 6.0 \
+  --record ./sim2real_data/run
+```
+
+见效标志 = 目标的逐步标准差向参考值靠拢，陀螺仪 RMS 明显降到 `0.4` rad/s 以下。
+想更强抑制就调低 `α`（如 `0.2`）；若觉得跟踪太滞后就调高（`0.5`）。
+
+> **这是治标不治本。** 平滑只是在部署环里掩盖了 sim2real 差距。根本的修复是在
+> 训练中建模延迟 + 动作滤波并重新导出——并先确认**同一** ONNX 在 MuJoCo（第 2 节）
+> 里是稳定的。此外，吊在吊架上时策略本身也处于分布外（没有地面接触），因此无论
+> 如何都会有残余抖动。
 
 ---
 
@@ -448,6 +494,7 @@ uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_real \
 | 真机：卡在“等待 LowState” | `--net` 网卡错误或机器人不在 DDS 网络上；用 `ip a` 找网卡，检查网线 / `rt/lowstate` 话题。 |
 | 真机：机器人下垂 / 撑不住姿态 | `--kp-scale` 太小；向 `1.0` 提高。Kp 太弱抵抗不了重力。 |
 | 真机：机器人过冲 / 振荡 | `--kp-scale` 太大或 `--kd-scale` 太小；降 Kp / 升 Kd。从 `0.25` / `0.5` 起步。 |
+| 真机：全身高频抖动 / “嗡嗡”振 | 策略极限环——启用**目标平滑**（`--target-ema 0.3`，可加 `--target-max-rate 6.0`）并降低 `--kp-scale`；见 5.5 节。先确认同一 ONNX 在 MuJoCo（第 2 节）里稳定。 |
 | 真机：动的肢体不对 | 关节映射问题——先用运动学回放（5.2 节）验证；电机顺序不同就设 `--joint2motor`。 |
 
 ---

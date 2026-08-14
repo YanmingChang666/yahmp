@@ -424,7 +424,9 @@ uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_real \
 ```
 
 Then drop `--dry-run` and raise `--kp-scale` / `--kd-scale` toward `1.0` as you
-gain confidence. `--net` is your DDS interface (`ip a` to find it).
+gain confidence. `--net` is your DDS interface (`ip a` to find it). If the robot
+buzzes or shakes at high frequency as you raise gains, enable **target
+smoothing** (§5.5) before pushing gains further.
 
 | Point | Detail |
 |---|---|
@@ -432,6 +434,57 @@ gain confidence. `--net` is your DDS interface (`ip a` to find it).
 | **No joint remap** | G1 motor order **equals** YAHMP's `joint_names` (legs→waist→arms); override with `--joint2motor` only if your robot differs. |
 | **IMU = pelvis** | YAHMP's root is the pelvis, so the pelvis IMU is used directly (no torso transform). If your IMU is on the torso, transform it to the pelvis frame first. |
 | **Validate in sim first** | Same ONNX with `--source npz` (§5.1) and the kinematic replay (§5.2) before ever energizing. |
+
+### 5.5 Target smoothing — breaking a sim2real limit cycle
+
+A policy that is stable in MuJoCo can still fall into a **high-frequency limit
+cycle** on hardware: the raw action chatters (an ~8–9 Hz oscillation), the
+motors cannot follow it, and the base shakes instead of standing. The driver is
+the sim2real gap — real actuation / sensing / DDS latency that training didn't
+fully model — amplified by running at full gains.
+
+The tell-tale sign is in a `--record` log (§5.4): the **mocap command is
+smooth** (~0.1°/step) while the **policy target chatters** (several °/step,
+reversing direction ~15×/s), and the base gyro shows RMS ≫ 0.1 rad/s. Use the
+recorder's `analyze` to see it per joint:
+
+```bash
+uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_recorder analyze ./sim2real_data/run_*_full.csv
+```
+
+`run_yahmp_onnx_real.py` can filter the **commanded target** to break the cycle.
+It smooths only what is sent to the motors — the observation fed back to the
+policy is left untouched, so sim/real observation parity is preserved.
+
+| Flag | Effect |
+|---|---|
+| `--target-ema α` | Exponential moving average on the target: `y = α·target + (1−α)·y_prev`. `α` = weight of the new sample, in `(0,1]`. `1.0` = off (default); smaller = heavier smoothing (and more lag). Start at `0.3`. |
+| `--target-max-rate R` | Hard per-joint slew-rate cap: `\|Δtarget\| ≤ R·control_dt` (rad/s). `0` = off (default). `6.0` ≈ 6.9°/step at 50 Hz — a safety clamp independent of the EMA. |
+
+Both are seeded with the held default pose, so the first commanded target starts
+from the current stance with no jump. Recommended: combine smoothing with the
+low gains from the safety guidance, and `--record` so you can compare runs:
+
+```bash
+uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_real \
+  --onnx-path assets/models/g1_yahmp.onnx --net enp4s0 \
+  --source chingmu --chingmu-host MCAvatar@192.168.123.112:3884 \
+  --sensor-root 301 --sensor-joint-first 302 \
+  --joint-order config/chingmu_joint_order.json \
+  --kp-scale 0.25 --kd-scale 0.75 \
+  --target-ema 0.3 --target-max-rate 6.0 \
+  --record ./sim2real_data/run
+```
+
+Success = the target's step-to-step std collapsing toward the reference's, and
+gyro RMS dropping well below `0.4` rad/s. Lower `α` (e.g. `0.2`) for more
+suppression; raise it (`0.5`) if tracking feels laggy.
+
+> **This is a band-aid, not the cure.** Smoothing masks the sim2real gap in the
+> deploy loop. The durable fix is to model the latency + an action filter in
+> training and re-export — and to confirm the *same* ONNX is stable in MuJoCo
+> (§2) first. On a hoist the policy is also out-of-distribution (no ground
+> contact), so expect residual motion regardless.
 
 ---
 
@@ -473,6 +526,7 @@ gain confidence. `--net` is your DDS interface (`ip a` to find it).
 | Real: hangs at "waiting for LowState" | Wrong `--net` interface or robot not on the DDS network; `ip a` to find the interface, check the cable/`rt/lowstate` topic. |
 | Real: robot sags / can't hold pose | `--kp-scale` too low; raise it toward `1.0`. Too-weak Kp can't counter gravity. |
 | Real: robot overshoots / oscillates | `--kp-scale` too high or `--kd-scale` too low; lower Kp / raise Kd. Start at `0.25` / `0.5`. |
+| Real: violent high-frequency shaking / buzzing (whole body) | Policy limit cycle — enable **target smoothing** (`--target-ema 0.3`, add `--target-max-rate 6.0`) and lower `--kp-scale`; see §5.5. Confirm the same ONNX is stable in MuJoCo (§2) first. |
 | Real: limbs move but wrong ones | Joint mapping — verify with the kinematic replay (§5.2); set `--joint2motor` if the motor order differs. |
 
 ---
