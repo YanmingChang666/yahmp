@@ -51,8 +51,10 @@ import numpy as np
 from yahmp.scripts.deploy.run_yahmp_onnx_mocap import (
   ChingMuMocapSource,
   LiveReference,
+  MocapCalibration,
   MocapState,
   NpzMockSource,
+  capture_calibration,
 )
 from yahmp.scripts.deploy.run_yahmp_onnx_recorder import Sim2RealRecorder
 from yahmp.scripts.deploy.run_yahmp_onnx_mujoco import (
@@ -380,6 +382,10 @@ def run(
   kd_scale: float,
   target_ema: float = 1.0,
   target_max_rate: float = 0.0,
+  mocap_calibration: str = "",
+  calibrate: str = "",
+  calibrate_seconds: float = 3.0,
+  calibrate_height_target: float = 0.793,
   dof2motor: Optional[np.ndarray] = None,
   lowcmd_topic: str,
   lowstate_topic: str,
@@ -413,7 +419,30 @@ def run(
   else:
     raise ValueError(f"Unknown --source {source_kind!r}.")
   source.start()
-  reference = LiveReference(state, spec, joint_order, vel_smoothing=vel_smoothing)
+
+  # ── Calibration capture (operator stands neutral; write JSON and exit) ───────
+  if calibrate:
+    raw_reference = LiveReference(state, spec, joint_order, vel_smoothing=0.0)
+    try:
+      capture_calibration(
+        raw_reference,
+        spec,
+        seconds=calibrate_seconds,
+        height_target=calibrate_height_target,
+        out_path=calibrate,
+      )
+    finally:
+      source.stop()
+    print("[Calibrate] done — the robot was NOT energized. Re-run with "
+          f"--mocap-calibration {calibrate} to teleoperate.")
+    return
+
+  calibration = MocapCalibration.load(mocap_calibration, spec) if mocap_calibration else None
+  if calibration is not None:
+    print(f"[INFO] mocap calibration loaded from {mocap_calibration}")
+  reference = LiveReference(
+    state, spec, joint_order, vel_smoothing=vel_smoothing, calibration=calibration
+  )
   reference.wait_for_detection(timeout_s=15.0)
 
   # ── Robot bring-up ─────────────────────────────────────────────────────────
@@ -525,6 +554,7 @@ def run(
           ang_vel=gyro,
           proj_grav=terms["projected_gravity"],
           raw_action=raw_action,
+          root_cmd=terms["command"][2 * n : 2 * n + 6],  # [vx,vy,wyaw,height,roll,pitch]
           timing=dict(
             infer_ms=infer_ms,
             step_ms=dt * 1e3,
@@ -559,6 +589,11 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--kd-scale", type=float, default=1.0, help="Scale trained Kd (start small, e.g. 0.5).")
   p.add_argument("--target-ema", type=float, default=1.0, help="EMA on the commanded target: weight of the new sample each step, (0,1]. 1.0=off. Try 0.3-0.5 to suppress high-frequency action chatter.")
   p.add_argument("--target-max-rate", type=float, default=0.0, help="Per-joint slew-rate cap on the target in rad/s. 0=off. e.g. 6.0 -> ~6.9 deg per 20ms step.")
+  # Mocap neutral-pose calibration
+  p.add_argument("--mocap-calibration", type=str, default="", help="Path to a neutral-pose calibration JSON (from --calibrate) to apply to the live command.")
+  p.add_argument("--calibrate", type=str, default="", help="CAPTURE mode: operator stands neutral; write a calibration JSON to this path and exit (robot NOT energized).")
+  p.add_argument("--calibrate-seconds", type=float, default=3.0, help="Seconds to average while capturing the neutral pose (--calibrate).")
+  p.add_argument("--calibrate-height-target", type=float, default=0.793, help="Nominal pelvis height (m) the neutral pose maps to (--calibrate). G1 default ~0.793.")
   p.add_argument("--dry-run", action="store_true", help="Run the full loop but keep motors limp (kp=kd=0).")
   p.add_argument("--record", type=str, default="", help="Sim2real CSV recording prefix, empty = off. e.g. --record ./sim2real_data/run")
   p.add_argument("--record-steps", type=int, default=0, help="Max steps to record (0 = unlimited).")
@@ -625,6 +660,10 @@ def main() -> None:
     kd_scale=float(args.kd_scale),
     target_ema=float(args.target_ema),
     target_max_rate=float(args.target_max_rate),
+    mocap_calibration=str(args.mocap_calibration),
+    calibrate=str(args.calibrate),
+    calibrate_seconds=float(args.calibrate_seconds),
+    calibrate_height_target=float(args.calibrate_height_target),
     dof2motor=dof2motor,
     lowcmd_topic=str(args.lowcmd_topic),
     lowstate_topic=str(args.lowstate_topic),

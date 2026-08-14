@@ -46,6 +46,7 @@ import argparse
 import json
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -149,6 +150,69 @@ def _root_ang_vel_world(q_prev: np.ndarray, q_cur: np.ndarray, dt: float) -> np.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Neutral-pose calibration (operator-standing-still → robot default stance)
+# ══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class MocapCalibration:
+  """Maps the operator's relaxed neutral pose to the robot's own default stance.
+
+  Captured once with `capture_calibration` (operator stands still), then applied
+  every frame inside `LiveReference.sample`. Without it, a retargeted "neutral"
+  human pose is *not* the robot's stable configuration — e.g. it commands nearly
+  straight knees where the robot needs a deep bend, so the robot cannot balance.
+
+    * joint bias   calibrated = raw − joint_offset
+                   joint_offset = mean(neutral_joint) − default_joint_pos
+                   (constant, so it does NOT perturb finite-differenced vels)
+    * root tilt    calibrated_quat = conj(root_quat_neutral) ⊗ raw_quat
+                   → neutral pelvis orientation becomes identity, so the command's
+                   root_roll / root_pitch ≈ 0 when the operator stands straight
+                   (also re-aligns neutral facing to robot +X).
+    * root height  calibrated_z = raw_z − root_height_neutral + root_height_target
+
+  Assumes a **Z-up** mocap world (ChingMu default): the neutral inverse alone
+  aligns the operator to the robot frame, with no extra axis swap.
+  """
+
+  joint_offset: np.ndarray        # (N,) policy joint order, radians
+  root_quat_neutral: np.ndarray   # (4,) wxyz
+  root_height_neutral: float
+  root_height_target: float
+
+  @classmethod
+  def load(cls, path: str | Path, spec: PolicySpec) -> "MocapCalibration":
+    data = json.loads(Path(path).read_text())
+    off = np.asarray(data["joint_offset_rad"], dtype=np.float64)
+    names = data.get("joint_names")
+    if names is not None and list(names) != list(spec.joint_names):
+      missing = [n for n in spec.joint_names if n not in names]
+      if missing:
+        raise ValueError(f"Calibration is missing joints {missing}.")
+      off = off[[list(names).index(n) for n in spec.joint_names]]
+    if off.shape != (len(spec.joint_names),):
+      raise ValueError(
+        f"joint_offset_rad has length {off.shape}, expected ({len(spec.joint_names)},)."
+      )
+    return cls(
+      joint_offset=off,
+      root_quat_neutral=_quat_normalize(
+        np.asarray(data.get("root_quat_neutral_wxyz", [1.0, 0.0, 0.0, 0.0]), dtype=np.float64)
+      ),
+      root_height_neutral=float(data.get("root_height_neutral", 0.0)),
+      root_height_target=float(data.get("root_height_target", 0.0)),
+    )
+
+  def apply(
+    self, joint_pos: np.ndarray, root_pos: np.ndarray, root_quat: np.ndarray
+  ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    jp = joint_pos - self.joint_offset
+    rp = root_pos.copy()
+    rp[2] = rp[2] - self.root_height_neutral + self.root_height_target
+    rq = _quat_normalize(_quat_mul(_quat_conj(self.root_quat_neutral), _quat_normalize(root_quat)))
+    return jp, rp, rq
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LiveReference: latest mocap pose  ->  MotionFrame  (drop-in `clip` replacement)
 # ══════════════════════════════════════════════════════════════════════════════
 class LiveReference:
@@ -168,10 +232,12 @@ class LiveReference:
     source_joint_order: Optional[list[str]],
     *,
     vel_smoothing: float = 0.0,
+    calibration: Optional[MocapCalibration] = None,
   ) -> None:
     self._state = state
     self._spec = spec
     self._alpha = float(np.clip(vel_smoothing, 0.0, 0.99))
+    self._calib = calibration
 
     if source_joint_order is None:
       if len(spec.joint_names) != state.joint_pos.shape[0]:
@@ -208,6 +274,12 @@ class LiveReference:
     root_pos, root_quat, joints_src, jvel, lvel, avel, _ = self._state.snapshot()
     joint_pos = joints_src[self._remap]
 
+    # Neutral-pose calibration: apply BEFORE finite-differencing so velocities
+    # (and the prev-sample cache) stay consistent with the calibrated frame. The
+    # joint bias is constant, so joint/root velocities are unaffected.
+    if self._calib is not None:
+      joint_pos, root_pos, root_quat = self._calib.apply(joint_pos, root_pos, root_quat)
+
     now = time.perf_counter()
     if self._prev is None:
       joint_vel = np.zeros_like(joint_pos) if jvel is None else jvel[self._remap]
@@ -242,6 +314,81 @@ class LiveReference:
   # `time + offset*control_dt`, which do not exist in a live stream. `_command_value`
   # only calls `.sample()`, so future steps here collapse to the current pose — an
   # approximation. Prefer the base `Mjlab-YAHMP-Unitree-G1` policy for teleop.
+
+
+def capture_calibration(
+  reference: LiveReference,
+  spec: PolicySpec,
+  *,
+  seconds: float,
+  height_target: float,
+  out_path: str | Path,
+) -> MocapCalibration:
+  """Average the live stream over a held neutral pose and write a calibration JSON.
+
+  Run with the operator standing still in a relaxed neutral pose. `reference`
+  must be an **uncalibrated** `LiveReference` so the raw (remapped) values are
+  captured; the resulting `joint_offset = mean(neutral) − default_joint_pos`
+  recenters neutral onto the robot's default stance.
+  """
+  default = np.asarray(spec.default_joint_pos, dtype=np.float64)
+  n = len(spec.joint_names)
+  jp_acc = np.zeros(n, dtype=np.float64)
+  q_acc = np.zeros(4, dtype=np.float64)
+  z_acc = 0.0
+  q_ref: Optional[np.ndarray] = None
+  frames = 0
+
+  reference.wait_for_detection(timeout_s=15.0)
+  print(f"[Calibrate] hold the NEUTRAL standing pose — capturing {seconds:.1f}s…")
+  t0 = time.perf_counter()
+  while time.perf_counter() - t0 < seconds:
+    f = reference.sample(0.0)
+    jp_acc += f.joint_pos
+    z_acc += float(f.root_pos_w[2])
+    q = _quat_normalize(np.asarray(f.root_quat_w, dtype=np.float64))
+    if q_ref is None:
+      q_ref = q
+    if float(np.dot(q, q_ref)) < 0.0:  # keep all samples in one hemisphere
+      q = -q
+    q_acc += q
+    frames += 1
+    time.sleep(max(spec.control_dt, 1e-3))
+
+  if frames == 0:
+    raise RuntimeError("No mocap frames captured during calibration.")
+
+  jp_mean = jp_acc / frames
+  q_mean = _quat_normalize(q_acc / frames)
+  z_mean = z_acc / frames
+  offset = jp_mean - default
+
+  out = {
+    "_comment": (
+      "Neutral-pose mocap calibration (Z-up). calibrated = raw - joint_offset; "
+      "root orientation zeroed via conj(root_quat_neutral); height retargeted."
+    ),
+    "joint_names": list(spec.joint_names),
+    "joint_offset_rad": [float(v) for v in offset],
+    "root_quat_neutral_wxyz": [float(v) for v in q_mean],
+    "root_height_neutral": float(z_mean),
+    "root_height_target": float(height_target),
+    "captured_frames": int(frames),
+  }
+  out_path = Path(out_path)
+  if out_path.parent and not out_path.parent.exists():
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+  out_path.write_text(json.dumps(out, indent=2))
+
+  worst = sorted(
+    zip(spec.joint_names, offset), key=lambda kv: -abs(kv[1])
+  )[:6]
+  print(f"[Calibrate] captured {frames} frames -> {out_path}")
+  print(f"[Calibrate] root height neutral={z_mean:+.3f} m  target={height_target:+.3f} m")
+  print("[Calibrate] largest joint offsets (subtracted from the stream):")
+  for name, off in worst:
+    print(f"             {name:>24s}  {np.degrees(off):+7.1f}°")
+  return MocapCalibration.load(out_path, spec)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

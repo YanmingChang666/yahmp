@@ -534,3 +534,7 @@ uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_real \
   --joint-order config/chingmu_joint_order.json \
   --kp-scale 0.25 --kd-scale 0.5 --dry-run
 ```
+
+# 数据回放
+
+uv run python -m yahmp.scripts.deploy.replay_yahmp_onnx_sim   --run run_20260814_023417 --run-dir ./sim2real_data

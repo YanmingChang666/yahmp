@@ -149,6 +149,9 @@ class Sim2RealRecorder:
     h += ["euler_roll", "euler_pitch", "euler_yaw"]
     h += ["ang_vel_x", "ang_vel_y", "ang_vel_z"]
     h += ["proj_grav_x", "proj_grav_y", "proj_grav_z"]
+    # Root terms of the motion command (what the policy is told the base should do)
+    h += ["cmd_anchor_vx", "cmd_anchor_vy", "cmd_anchor_wyaw"]
+    h += ["cmd_root_height", "cmd_root_roll", "cmd_root_pitch"]
     # Per-joint signals
     h += [f"ref_{n}" for n in names]        # mocap reference (what the human does)
     h += [f"target_{n}" for n in names]     # position commanded to the motor
@@ -175,9 +178,15 @@ class Sim2RealRecorder:
     ang_vel: np.ndarray,
     proj_grav: np.ndarray,
     raw_action: np.ndarray,
+    root_cmd: Optional[np.ndarray] = None,
     timing: Optional[dict] = None,
   ) -> None:
-    """Append one control step to the CSV."""
+    """Append one control step to the CSV.
+
+    `root_cmd` is the 6 root terms of the motion command in native order
+    `[anchor_vx, anchor_vy, anchor_wyaw, root_height, root_roll, root_pitch]`
+    (e.g. `command[2*N : 2*N+6]`); pass `None` to log them as `nan`.
+    """
     if self._t0 is None:
       self._t0 = wall_time
     rel_time = wall_time - self._t0
@@ -194,6 +203,11 @@ class Sim2RealRecorder:
     euler = _quat_roll_pitch_yaw(q)
     gyro = np.asarray(ang_vel, dtype=np.float64)
     pg = np.asarray(proj_grav, dtype=np.float64)
+    rc = (
+      np.full(6, np.nan)
+      if root_cmd is None
+      else np.asarray(root_cmd, dtype=np.float64).reshape(-1)[:6]
+    )
     action = np.asarray(raw_action, dtype=np.float64).reshape(-1)
 
     # Fix the action width and write the header on the first row.
@@ -207,6 +221,7 @@ class Sim2RealRecorder:
     row += [f"{float(euler[i]):.5f}" for i in range(3)]
     row += [f"{float(gyro[i]):.4f}" for i in range(3)]
     row += [f"{float(pg[i]):.5f}" for i in range(3)]
+    row += [f"{float(rc[i]):.5f}" for i in range(6)]
     row += [f"{v:.5f}" for v in ref]
     row += [f"{v:.5f}" for v in tp]
     row += [f"{v:.5f}" for v in ap]
@@ -322,6 +337,18 @@ def cmd_analyze(path: str) -> None:
         f"range=[{math.degrees(arr.min()):+.2f}°, {math.degrees(arr.max()):+.2f}°]  "
         f"std={math.degrees(arr.std()):.2f}°"
       )
+
+  # ── Command root terms (calibration check: roll/pitch ~ 0 when operator neutral)
+  for label, col in (("cmd_root_roll", "cmd_root_roll"), ("cmd_root_pitch", "cmd_root_pitch")):
+    arr = _col_floats(rows, col)
+    if arr.size:
+      print(
+        f"  {label:14s} mean={math.degrees(arr.mean()):+.2f}°  "
+        f"std={math.degrees(arr.std()):.2f}°  (calibrated neutral ~= 0°)"
+      )
+  h_arr = _col_floats(rows, "cmd_root_height")
+  if h_arr.size:
+    print(f"  cmd_root_height mean={h_arr.mean():+.3f} m  std={h_arr.std():.3f} m")
 
   # ── Loop timing ───────────────────────────────────────────────────────────
   step_ms = _col_floats(rows, "t_step_ms")
