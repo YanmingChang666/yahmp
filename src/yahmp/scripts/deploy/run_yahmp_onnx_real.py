@@ -311,6 +311,58 @@ def _decode_targets(spec, raw_action, frame, default_joint_pos, action_target_jo
   return target
 
 
+class TargetSmoother:
+  """Low-pass + slew-rate limit on the per-joint position target.
+
+  A YAHMP policy can fall into a high-frequency limit cycle on hardware (an
+  ~8-9 Hz chatter in the raw action) that never showed up in sim, because the
+  real actuation/sensing latency is not modelled in training. The motors cannot
+  follow such a target and the base shakes instead of standing. This filter
+  breaks that limit cycle mechanically by smoothing the *commanded* target only
+  — the observation fed back to the policy is left untouched, so sim/real
+  observation parity is preserved.
+
+  Two independent, composable stages (either can be disabled):
+
+    * EMA         y = ema · target + (1 - ema) · y_prev
+                  `ema` is the weight of the new sample: 1.0 = off (passthrough),
+                  smaller = heavier smoothing (and more lag). 0.3-0.5 is a good
+                  starting range for suppressing chatter.
+    * rate limit  |y - y_prev| <= max_rate · control_dt   (applied per joint)
+                  A hard cap on how fast any target may slew, in rad/s. 0 = off.
+
+  State is seeded with `init` (the default/held pose) so the first commanded
+  target starts from the current stance without a step.
+  """
+
+  def __init__(
+    self,
+    *,
+    init: np.ndarray,
+    ema: float,
+    max_rate: float,
+    control_dt: float,
+  ) -> None:
+    if not 0.0 < ema <= 1.0:
+      raise ValueError(f"--target-ema must be in (0, 1], got {ema}.")
+    if max_rate < 0.0:
+      raise ValueError(f"--target-max-rate must be >= 0, got {max_rate}.")
+    self._prev = np.asarray(init, dtype=np.float64).copy()
+    self._ema = float(ema)
+    self._max_step = float(max_rate) * float(control_dt) if max_rate > 0.0 else 0.0
+
+  @property
+  def enabled(self) -> bool:
+    return self._ema < 1.0 or self._max_step > 0.0
+
+  def step(self, target: np.ndarray) -> np.ndarray:
+    y = self._ema * np.asarray(target, dtype=np.float64) + (1.0 - self._ema) * self._prev
+    if self._max_step > 0.0:
+      y = self._prev + np.clip(y - self._prev, -self._max_step, self._max_step)
+    self._prev = y
+    return y
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
@@ -326,7 +378,9 @@ def run(
   vel_smoothing: float,
   kp_scale: float,
   kd_scale: float,
-  dof2motor: Optional[np.ndarray],
+  target_ema: float = 1.0,
+  target_max_rate: float = 0.0,
+  dof2motor: Optional[np.ndarray] = None,
   lowcmd_topic: str,
   lowstate_topic: str,
   dry_run: bool,
@@ -402,6 +456,8 @@ def run(
         source=source_kind,
         kp_scale=kp_scale,
         kd_scale=kd_scale,
+        target_ema=target_ema,
+        target_max_rate=target_max_rate,
         dry_run=dry_run,
         control_dt=spec.control_dt,
         action_semantics=spec.action_semantics,
@@ -410,6 +466,22 @@ def run(
     if record
     else None
   )
+
+  # ── Target smoother (breaks the sim2real high-freq limit cycle) ─────────────
+  target_smoother = TargetSmoother(
+    init=default_joint_pos,
+    ema=target_ema,
+    max_rate=target_max_rate,
+    control_dt=spec.control_dt,
+  )
+  if target_smoother.enabled:
+    print(
+      f"[INFO] target smoothing ON: ema={target_ema:.2f} "
+      f"max_rate={target_max_rate:.2f} rad/s "
+      f"({target_max_rate * spec.control_dt * 180.0 / np.pi:.1f}°/step)"
+    )
+  else:
+    print("[INFO] target smoothing OFF (raw policy target sent to motors).")
 
   # ── Control loop ───────────────────────────────────────────────────────────
   print("[G1] policy running. Press SELECT to stop (→ damping).")
@@ -432,6 +504,7 @@ def run(
       )
       infer_ms = (time.perf_counter() - t_infer0) * 1e3
       target = _decode_targets(spec, raw_action, frame, default_joint_pos, action_target_joint_indices)
+      target = target_smoother.step(target)  # smooth the commanded target only (obs left untouched)
       robot.send_targets(target, kp_scale, kd_scale)
 
       prev_action = raw_action
@@ -484,6 +557,8 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--vel-smoothing", type=float, default=0.7)
   p.add_argument("--kp-scale", type=float, default=1.0, help="Scale trained Kp (start small, e.g. 0.25).")
   p.add_argument("--kd-scale", type=float, default=1.0, help="Scale trained Kd (start small, e.g. 0.5).")
+  p.add_argument("--target-ema", type=float, default=1.0, help="EMA on the commanded target: weight of the new sample each step, (0,1]. 1.0=off. Try 0.3-0.5 to suppress high-frequency action chatter.")
+  p.add_argument("--target-max-rate", type=float, default=0.0, help="Per-joint slew-rate cap on the target in rad/s. 0=off. e.g. 6.0 -> ~6.9 deg per 20ms step.")
   p.add_argument("--dry-run", action="store_true", help="Run the full loop but keep motors limp (kp=kd=0).")
   p.add_argument("--record", type=str, default="", help="Sim2real CSV recording prefix, empty = off. e.g. --record ./sim2real_data/run")
   p.add_argument("--record-steps", type=int, default=0, help="Max steps to record (0 = unlimited).")
@@ -548,6 +623,8 @@ def main() -> None:
     vel_smoothing=float(args.vel_smoothing),
     kp_scale=float(args.kp_scale),
     kd_scale=float(args.kd_scale),
+    target_ema=float(args.target_ema),
+    target_max_rate=float(args.target_max_rate),
     dof2motor=dof2motor,
     lowcmd_topic=str(args.lowcmd_topic),
     lowstate_topic=str(args.lowstate_topic),
