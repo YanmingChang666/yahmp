@@ -132,7 +132,12 @@ uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mujoco \
 
 ## 4. 部署到真实 Unitree G1
 
-仓库不提供真机脚本，需要你自己写：以
+> **现已提供参考实现：**
+> [`run_yahmp_onnx_real.py`](src/yahmp/scripts/deploy/run_yahmp_onnx_real.py)
+> （5.4 节）已经把下面这些都做好了——Unitree SDK 读写、从元数据取增益、安全启动
+> 流程、动捕驱动的指令。想直接运行请跳到 5.4 节；本节讲**它是怎么工作的**，方便你改。
+
+要自己写真机运行时，以
 [`run_yahmp_onnx_mujoco.py`](src/yahmp/scripts/deploy/run_yahmp_onnx_mujoco.py)
 为模板，把 MuJoCo 的读写替换为 Unitree SDK
 （[`unitree_sdk2_python`](https://github.com/unitreerobotics/unitree_sdk2_python)，
@@ -354,8 +359,55 @@ uv run python -m yahmp.scripts.deploy.chingmu_hierarchy --host MCAvatar@192.168.
   里并不存在（脚本会用当前姿态近似替代）。遥操作请优先用 `Mjlab-YAHMP-Unitree-G1`。
 - **速度噪声。** 有限差分得到的动捕速度会抖动——调 `--vel-smoothing 0.5–0.8`，
   或把真实速度流喂进 `MocapState.update(joint_vel=...)`。
-- **仅 sim2sim。** 若要 **sim2real**，按第 4 节把 MuJoCo 的 `data` 读写替换为
-  Unitree SDK 即可——动捕/指令这一半完全不变。先完成第 6 节的安全清单。
+- **从 sim2sim 到 sim2real。** 动捕/指令这一半在真机上完全相同——
+  `run_yahmp_onnx_real.py`（5.4 节）就是这么做的。先完成第 6 节的安全清单。
+
+### 5.4 Sim2real——遥操作真实 G1
+
+[`run_yahmp_onnx_real.py`](src/yahmp/scripts/deploy/run_yahmp_onnx_real.py)
+在真机上闭环：通过 Unitree SDK 读取 G1 的关节编码器 + 骨盆 IMU，构建**与仿真完全
+相同**的 YAHMP 观测，运行 ONNX 策略，并用训练时的 Kp/Kd 下发关节位置目标。它照搬了
+经过验证的 Beyondmimic `deploy_real4bydmimic.py` 的启动流程，并**原样复用** YAHMP
+的观测/动作代码，保证 sim/real 一致。
+
+> ⚠️ **真机操作。** 先完成第 6 节安全清单。此脚本**尚未经过真机测试**——请在吊架上、
+> 用小增益 + `--dry-run` 验证后再逐步放开。
+
+**前置依赖**（不是 YAHMP 的依赖，需单独安装）：
+
+```bash
+uv pip install unitree_sdk2py
+```
+
+**启动流程**（通过无线手柄由操作员逐步放行）：
+
+1. 零力矩——把机器人吊起，按 **START**。
+2. 2 秒斜坡运动到 `default_joint_pos`。
+3. 保持默认姿态——按 **A** 开始策略跟踪。
+4. 跟踪动捕；按 **SELECT** 停止（→ 阻尼状态）。
+
+**推荐的首次运行——小增益 + dry-run。** `--dry-run` 会跑完整个循环
+（状态 → 观测 → 策略 → 目标），但让电机保持**松弛**（`kp=kd=0`），从而在不上电的
+情况下验证整条链路：
+
+```bash
+uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_real \
+  --onnx-path assets/models/g1_yahmp.onnx --net enp4s0 \
+  --source chingmu --chingmu-host MCAvatar@192.168.123.112:3884 \
+  --sensor-root 301 --sensor-joint-first 302 \
+  --joint-order config/chingmu_joint_order.json \
+  --kp-scale 0.25 --kd-scale 0.5 --dry-run
+```
+
+确认无误后去掉 `--dry-run`，并随信心增加把 `--kp-scale` / `--kd-scale` 逐步升到
+`1.0`。`--net` 是你的 DDS 网卡（用 `ip a` 查看）。
+
+| 要点 | 说明 |
+|---|---|
+| **增益来自策略** | Kp/Kd 从 ONNX 的 `joint_stiffness` / `joint_damping` 读取；`--kp-scale` / `--kd-scale` 对其缩放以温和起步（即你说的*用小 Kp/Kd 防止过度运动*）。 |
+| **无需关节重排** | G1 电机顺序**等于** YAHMP 的 `joint_names`（腿→腰→臂）；仅当你的机器人不同才用 `--joint2motor` 覆盖。 |
+| **IMU = 骨盆** | YAHMP 的根是骨盆，因此直接使用骨盆 IMU（无需 torso 变换）。若你的 IMU 在 torso，请先变换到骨盆系。 |
+| **先在仿真验证** | 上电前先用同一 ONNX 跑 `--source npz`（5.1 节）和运动学回放（5.2 节）。 |
 
 ---
 
@@ -392,6 +444,11 @@ uv run python -m yahmp.scripts.deploy.chingmu_hierarchy --host MCAvatar@192.168.
 | 遥操作：`Joints missing from --joint-order` | `--joint-order` JSON 缺少策略 `joint_names` 中的某个关节；打印策略顺序（5.2 节）对齐。 |
 | 遥操作：机器人跟踪出镜像/漂移的姿态 | 坐标系标定问题（5.2 节）——在 `ChingMuMocapSource._on_tracker` 里修正根偏移/旋转。 |
 | 遥操作：机器人剧烈抖动 | 提高 `--vel-smoothing`（如 `0.7`），或改用基础（非 Future）策略。 |
+| 真机：`ModuleNotFoundError: unitree_sdk2py` | 装到环境里：`uv pip install unitree_sdk2py`。 |
+| 真机：卡在“等待 LowState” | `--net` 网卡错误或机器人不在 DDS 网络上；用 `ip a` 找网卡，检查网线 / `rt/lowstate` 话题。 |
+| 真机：机器人下垂 / 撑不住姿态 | `--kp-scale` 太小；向 `1.0` 提高。Kp 太弱抵抗不了重力。 |
+| 真机：机器人过冲 / 振荡 | `--kp-scale` 太大或 `--kd-scale` 太小；降 Kp / 升 Kd。从 `0.25` / `0.5` 起步。 |
+| 真机：动的肢体不对 | 关节映射问题——先用运动学回放（5.2 节）验证；电机顺序不同就设 `--joint2motor`。 |
 
 ---
 
@@ -421,5 +478,12 @@ uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mocap \
   --onnx-path assets/models/g1_yahmp.onnx \
   --source npz --npz-clip assets/motions/g1_omomo_amass_clean/<motion>.npz
 
-# 真机：把 run_yahmp_onnx_mujoco.py 移植到 unitree_sdk2_python（第 4 节）
+# 真机（sim2real）：先小增益 + dry-run —— 详见 5.4 节 / 第 6 节安全清单
+uv pip install unitree_sdk2py
+uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_real \
+  --onnx-path assets/models/g1_yahmp.onnx --net enp4s0 \
+  --source chingmu --chingmu-host MCAvatar@192.168.123.112:3884 \
+  --sensor-root 301 --sensor-joint-first 302 \
+  --joint-order config/chingmu_joint_order.json \
+  --kp-scale 0.25 --kd-scale 0.5 --dry-run
 ```

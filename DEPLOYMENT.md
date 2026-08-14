@@ -140,7 +140,13 @@ the MuJoCo runner) instead of hard-coding anything:
 
 ## 4. Deploy to a real Unitree G1
 
-There is no shipped hardware script — you write one by mirroring
+> **A reference implementation now ships:**
+> [`run_yahmp_onnx_real.py`](src/yahmp/scripts/deploy/run_yahmp_onnx_real.py)
+> (§5.4) already does everything below — Unitree SDK I/O, gains from metadata,
+> safe bring-up, mocap-driven command. This section explains **how it works** so
+> you can adapt it; jump to §5.4 for the ready-to-run command.
+
+You build a hardware runtime by mirroring
 [`run_yahmp_onnx_mujoco.py`](src/yahmp/scripts/deploy/run_yahmp_onnx_mujoco.py)
 and swapping MuJoCo I/O for the Unitree SDK
 ([`unitree_sdk2_python`](https://github.com/unitreerobotics/unitree_sdk2_python),
@@ -375,9 +381,57 @@ ships in identity order — reorder it to match the dump (see
 - **Velocity noise.** Finite-differenced mocap velocities are jittery — tune
   `--vel-smoothing 0.5–0.8`, or feed a real velocity stream into
   `MocapState.update(joint_vel=...)`.
-- **sim2sim only.** For **sim2real**, swap the MuJoCo `data` read/write for the
-  Unitree SDK exactly as in §4 — the mocap/command half is identical. Complete
-  the §6 safety checklist first.
+- **From sim2sim to sim2real.** The mocap/command half is identical on hardware
+  — `run_yahmp_onnx_real.py` (§5.4) does exactly this. Complete the §6 safety
+  checklist first.
+
+### 5.4 Sim2real — teleoperate the physical G1
+
+[`run_yahmp_onnx_real.py`](src/yahmp/scripts/deploy/run_yahmp_onnx_real.py)
+closes the loop on real hardware: it reads the G1's joint encoders + pelvis IMU
+over the Unitree SDK, builds the **same** YAHMP observation as the sim, runs the
+ONNX policy, and sends joint-position targets with the trained Kp/Kd. It mirrors
+the proven Beyondmimic `deploy_real4bydmimic.py` bring-up sequence and reuses
+YAHMP's obs/action code verbatim for sim/real parity.
+
+> ⚠️ **Physical robot.** Do the §6 safety checklist first. This script has **not
+> been hardware-tested** — validate on a hoist, with small gains and `--dry-run`.
+
+**Prerequisite** (not a YAHMP dependency — install separately):
+
+```bash
+uv pip install unitree_sdk2py
+```
+
+**Bring-up sequence** (operator-gated via the wireless remote):
+
+1. Zero-torque — hoist the robot, press **START**.
+2. 2 s ramp to `default_joint_pos`.
+3. Hold default — press **A** to begin policy tracking.
+4. Track the mocap; press **SELECT** to stop (→ damping state).
+
+**Recommended first run — small gains + dry-run.** `--dry-run` runs the whole
+loop (state → obs → policy → targets) but keeps the motors **limp** (`kp=kd=0`),
+so you validate the pipeline without energizing:
+
+```bash
+uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_real \
+  --onnx-path assets/models/g1_yahmp.onnx --net enp4s0 \
+  --source chingmu --chingmu-host MCAvatar@192.168.123.112:3884 \
+  --sensor-root 301 --sensor-joint-first 302 \
+  --joint-order config/chingmu_joint_order.json \
+  --kp-scale 0.25 --kd-scale 0.5 --dry-run
+```
+
+Then drop `--dry-run` and raise `--kp-scale` / `--kd-scale` toward `1.0` as you
+gain confidence. `--net` is your DDS interface (`ip a` to find it).
+
+| Point | Detail |
+|---|---|
+| **Gains from the policy** | Kp/Kd are read from the ONNX `joint_stiffness` / `joint_damping`; `--kp-scale` / `--kd-scale` scale them for a gentle start (your *small Kp/Kd to prevent excessive motion*). |
+| **No joint remap** | G1 motor order **equals** YAHMP's `joint_names` (legs→waist→arms); override with `--joint2motor` only if your robot differs. |
+| **IMU = pelvis** | YAHMP's root is the pelvis, so the pelvis IMU is used directly (no torso transform). If your IMU is on the torso, transform it to the pelvis frame first. |
+| **Validate in sim first** | Same ONNX with `--source npz` (§5.1) and the kinematic replay (§5.2) before ever energizing. |
 
 ---
 
@@ -415,6 +469,11 @@ ships in identity order — reorder it to match the dump (see
 | Teleop: `Joints missing from --joint-order` | Your `--joint-order` JSON is missing a name from the policy's `joint_names`; print the policy order (§5.2) and align them. |
 | Teleop: robot tracks a mirrored / drifting pose | Frame calibration (§5.2) — fix the root offset/rotation in `ChingMuMocapSource._on_tracker`. |
 | Teleop: robot jitters violently | Raise `--vel-smoothing` (e.g. `0.7`), or use the base (not Future) policy. |
+| Real: `ModuleNotFoundError: unitree_sdk2py` | Install it into the env: `uv pip install unitree_sdk2py`. |
+| Real: hangs at "waiting for LowState" | Wrong `--net` interface or robot not on the DDS network; `ip a` to find the interface, check the cable/`rt/lowstate` topic. |
+| Real: robot sags / can't hold pose | `--kp-scale` too low; raise it toward `1.0`. Too-weak Kp can't counter gravity. |
+| Real: robot overshoots / oscillates | `--kp-scale` too high or `--kd-scale` too low; lower Kp / raise Kd. Start at `0.25` / `0.5`. |
+| Real: limbs move but wrong ones | Joint mapping — verify with the kinematic replay (§5.2); set `--joint2motor` if the motor order differs. |
 
 ---
 
@@ -444,5 +503,12 @@ uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_mocap \
   --onnx-path assets/models/g1_yahmp.onnx \
   --source npz --npz-clip assets/motions/g1_omomo_amass_clean/<motion>.npz
 
-# Real robot: port run_yahmp_onnx_mujoco.py to unitree_sdk2_python (Section 4)
+# Real robot (sim2real): small gains + dry-run first — SEE §5.4 / §6 SAFETY
+uv pip install unitree_sdk2py
+uv run python -m yahmp.scripts.deploy.run_yahmp_onnx_real \
+  --onnx-path assets/models/g1_yahmp.onnx --net enp4s0 \
+  --source chingmu --chingmu-host MCAvatar@192.168.123.112:3884 \
+  --sensor-root 301 --sensor-joint-first 302 \
+  --joint-order config/chingmu_joint_order.json \
+  --kp-scale 0.25 --kd-scale 0.5 --dry-run
 ```
