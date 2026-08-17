@@ -220,9 +220,41 @@ def robot_joint_layout(xml_path: str):
 # ══════════════════════════════════════════════════════════════════════════════
 # Main retarget loop
 # ══════════════════════════════════════════════════════════════════════════════
+def _resolve_gmr_class(pkg):
+  """The retargeter class, tolerant of fork naming (GeneralMotionRetargeting/GMR)."""
+  for name in ("GeneralMotionRetargeting", "GMR"):
+    cls = getattr(pkg, name, None)
+    if cls is not None:
+      return cls
+  raise SystemExit(
+    "general_motion_retargeting exposes no GeneralMotionRetargeting/GMR class. "
+    f"Available top-level names: {[n for n in dir(pkg) if not n.startswith('_')]}. "
+    "Tell me these and I'll adapt the import."
+  )
+
+
+def _resolve_robot_xml(pkg, robot: str, override: Optional[str]) -> str:
+  """Robot MJCF path: --robot-xml wins; else the fork's ROBOT_XML_DICT."""
+  if override:
+    return override
+  table = getattr(pkg, "ROBOT_XML_DICT", None)
+  if table is None:
+    raise SystemExit(
+      "This GMR build has no ROBOT_XML_DICT — pass --robot-xml <path to robot MJCF>."
+    )
+  if robot not in table:
+    raise SystemExit(
+      f"--robot {robot!r} not in ROBOT_XML_DICT (keys: {list(table)}). Use --robot-xml."
+    )
+  return table[robot]
+
+
 def run(args: argparse.Namespace) -> None:
   import redis
-  from general_motion_retargeting import GMR, ROBOT_XML_DICT  # gmr env only
+  import general_motion_retargeting as gmr_pkg  # gmr env only
+
+  GMR = _resolve_gmr_class(gmr_pkg)
+  robot_xml = _resolve_robot_xml(gmr_pkg, args.robot, args.robot_xml)
 
   body_map = json.loads(open(args.body_map, encoding="utf-8").read())
   reader = ChingMuSkeletonReader(
@@ -231,12 +263,14 @@ def run(args: argparse.Namespace) -> None:
     body_map=body_map,
     pos_scale=args.pos_scale,
   )
+  # NOTE: TWIST2's constructor is GMR(src_human=, tgt_robot=, actual_human_height=).
+  # If your droid_gmr fork differs, the TypeError names the expected args — send it over.
   retarget = GMR(
     src_human=args.src_human,
     tgt_robot=args.robot,
     actual_human_height=args.actual_human_height,
   )
-  joint_names, joint_adr = robot_joint_layout(ROBOT_XML_DICT[args.robot])
+  joint_names, joint_adr = robot_joint_layout(robot_xml)
   print(f"[GMR] {args.robot}: {len(joint_names)} joints; retarget src={args.src_human}")
 
   r = redis.Redis(host=args.redis_host, port=args.redis_port, db=args.redis_db)
@@ -309,6 +343,7 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--body-map", type=str, required=True, help="JSON {chingmu_sensor_id: gmr_body_name}.")
   p.add_argument("--pos-scale", type=float, default=0.001, help="ChingMu position units -> metres (mm=0.001).")
   p.add_argument("--robot", type=str, default="unitree_g1", help="GMR tgt_robot key (ROBOT_XML_DICT).")
+  p.add_argument("--robot-xml", type=str, default=None, help="Robot MJCF path; overrides ROBOT_XML_DICT if the fork lacks it.")
   p.add_argument("--src-human", type=str, default="xrobot", help="GMR src_human preset for your input skeleton.")
   p.add_argument("--actual-human-height", type=float, default=1.6, help="Operator height (m); GMR scales to it.")
   p.add_argument("--target-fps", type=float, default=100.0)
