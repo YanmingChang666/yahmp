@@ -75,6 +75,7 @@ from yahmp.scripts.deploy.run_yahmp_onnx_mujoco import (
   _root_addresses,
   _term_values,
 )
+from yahmp.scripts.deploy.run_yahmp_onnx_recorder import Sim2RealRecorder
 
 
 def _quat_from_euler(roll: float, pitch: float, yaw: float) -> np.ndarray:
@@ -1057,6 +1058,8 @@ def run(
   mocap_calibration: str = "",
   calibrate_height_target: float = 0.793,
   redis_kwargs: Optional[dict] = None,
+  record: str = "",
+  record_steps: int = 0,
 ) -> None:
   redis_kwargs = redis_kwargs or {}
   spec = PolicySpec.from_onnx(onnx_path)
@@ -1106,6 +1109,9 @@ def run(
     calibration=(None if mode == "calibrate" else calibration),
   )
   reference.wait_for_detection(timeout_s=15.0)
+
+  if record and mode != "teleop":
+    print(f"[Recorder] --record is ignored in --mode {mode} (only --mode teleop logs a run).")
 
   # ── Interactive calibration: tune root R/P/Y live in the viewer, save JSON ──
   if mode == "calibrate":
@@ -1168,8 +1174,38 @@ def run(
   print(f"[INFO] ONNX providers: {providers}")
   print(f"[INFO] Teleop source: {source_kind}  control_dt={spec.control_dt:.4f}s")
 
+  # ── Sim2sim data recorder (optional; --record) ─────────────────────────────
+  # Same CSV/meta format as run_yahmp_onnx_real.py --record, so the identical
+  # `run_yahmp_onnx_recorder analyze` / `replay_yahmp_onnx_sim` tools apply and a
+  # sim run can be compared column-for-column against a real one (e.g. to see why
+  # MuJoCo shakes while the robot does not).
+  n = len(spec.joint_names)
+  default_joint_pos = np.asarray(spec.default_joint_pos, dtype=np.float64)
+  recorder = (
+    Sim2RealRecorder(
+      record,
+      spec.joint_names,
+      action_target_names=spec.action_target_names,
+      meta=dict(
+        sim2sim=True,
+        onnx_path=str(onnx_path),
+        task_id=task_id,
+        source=source_kind,
+        mode=mode,
+        vel_smoothing=vel_smoothing,
+        mocap_calibration=mocap_calibration or None,
+        calibrated=bool(calibration is not None),
+        control_dt=spec.control_dt,
+        action_semantics=spec.action_semantics,
+      ),
+    )
+    if record
+    else None
+  )
+
   import mujoco.viewer as mujoco_viewer
 
+  prev_loop_start: Optional[float] = None
   with mujoco_viewer.launch_passive(model, data) as viewer:
     _configure_camera(viewer, model, spec.root_body_name, viewer_cfg)
     try:
@@ -1189,17 +1225,60 @@ def run(
           joint_qpos_adr, joint_qvel_adr, previous_action,
         )
         obs = _build_observation(spec, terms, history)  # (1727,) — concatenated in spec.observation_terms order
+        t_infer0 = time.perf_counter()
         raw_action = (
           session.run([output_name], {input_name: obs[None, :].astype(np.float32)})[0]
           .reshape(-1)
           .astype(np.float32)  # (29,) = action_dim
         )
+        infer_ms = (time.perf_counter() - t_infer0) * 1e3
+
+        # Capture the state the policy acted on (pre-step) + the target it commands.
+        if recorder is not None:
+          actual_joint_pos = np.asarray(data.qpos[joint_qpos_adr], dtype=np.float64).copy()
+          actual_joint_vel = np.asarray(data.qvel[joint_qvel_adr], dtype=np.float64).copy()
+          base_quat = np.asarray(
+            data.qpos[root_qpos_adr + 3 : root_qpos_adr + 7], dtype=np.float64
+          ).copy()  # wxyz
 
         _apply_action(
           data, spec, raw_action, frame, action_actuator_ids, action_target_joint_indices
         )
+        # Read the position targets back from ctrl (DRY: exactly what _apply_action sent).
+        if recorder is not None:
+          target_joint_pos = default_joint_pos.copy()
+          target_joint_pos[action_target_joint_indices] = np.asarray(
+            data.ctrl[action_actuator_ids], dtype=np.float64
+          )
+
         for _ in range(steps_per_control):
           mujoco.mj_step(model, data)
+
+        if recorder is not None:
+          step_ms = (time.perf_counter() - wall_t0) * 1e3
+          recorder.step(
+            wall_time=wall_t0,
+            ref_joint_pos=frame.joint_pos,                 # mocap reference (the human)
+            target_joint_pos=target_joint_pos,             # position setpoint sent to actuators
+            actual_joint_pos=actual_joint_pos,             # measured joint position (sim)
+            actual_joint_vel=actual_joint_vel,             # measured joint velocity (sim)
+            quat=base_quat,                                # pelvis orientation wxyz
+            ang_vel=terms["base_ang_vel"],                 # base angular velocity, body frame
+            proj_grav=terms["projected_gravity"],
+            raw_action=raw_action,                         # policy output (chatter shows here)
+            root_cmd=terms["command"][2 * n : 2 * n + 6],  # [vx,vy,wyaw,height,roll,pitch]
+            timing=dict(
+              infer_ms=infer_ms,
+              step_ms=step_ms,
+              period_ms=(wall_t0 - prev_loop_start) * 1e3 if prev_loop_start is not None else float("nan"),
+              overrun=step_ms > spec.control_dt * 1e3,
+            ),
+          )
+          if record_steps > 0 and recorder.count >= record_steps:
+            print("[Recorder] reached --record-steps limit, stopping recording.")
+            recorder.close()
+            recorder = None
+        prev_loop_start = wall_t0
 
         previous_action = raw_action
         next_frame = reference.sample(0.0)
@@ -1213,6 +1292,8 @@ def run(
         time.sleep(max(0.0, spec.control_dt - (time.perf_counter() - wall_t0)))
     finally:
       source.stop()
+      if recorder is not None and recorder.count > 0:
+        recorder.close()
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -1257,6 +1338,15 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--redis-db", type=int, default=0)
   p.add_argument("--redis-key", type=str, default="yahmp:mocap:pose")
   p.add_argument("--redis-poll-hz", type=float, default=200.0)
+  # Recording (teleop only) — same format as run_yahmp_onnx_real.py --record
+  p.add_argument(
+    "--record",
+    type=str,
+    default="",
+    help="Sim2sim CSV recording prefix, empty = off. e.g. --record ./sim2real_data/sim. "
+    "Analyze with `run_yahmp_onnx_recorder analyze` or replay with replay_yahmp_onnx_sim.",
+  )
+  p.add_argument("--record-steps", type=int, default=0, help="Max control steps to record (0 = unlimited).")
   return p
 
 
@@ -1318,6 +1408,8 @@ def main() -> None:
     mocap_calibration=str(args.mocap_calibration),
     calibrate_height_target=float(args.calibrate_height_target),
     redis_kwargs=redis_kwargs,
+    record=str(args.record),
+    record_steps=int(args.record_steps),
   )
 
 
