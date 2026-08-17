@@ -130,8 +130,13 @@ class _VrpnTracker(ctypes.Structure):
 
 
 class ChingMuSkeletonReader:
-  """Reads all ChingMu human-skeleton segments over VRPN and buckets each by
-  sensor id into `{body_name: (pos_m[3], quat_xyzw[4])}` per `body_map`.
+  """Reads ChingMu human-skeleton segments over the CMTrackerExternTC POLLING
+  API (indexed by body_id, as TTRL's WaistBodyPollerLive does) into
+  `{body_name: (pos_m[3], quat_xyzw[4])}` per `body_map`.
+
+  The polling API (not the tracker-data callback) is where the human skeleton
+  lives — the callback only carries rigid bodies. `body_map` therefore maps
+  ChingMu **body_id** (from --probe-poll) → GMR smplx body name.
 
   Unlike the yahmp `ChingMuMocapSource` (which reads pre-retargeted *robot* joint
   angles), this reads the raw *human* body poses that GMR needs as its input.
@@ -144,31 +149,21 @@ class ChingMuSkeletonReader:
     body_map: dict[int, str],
     *,
     pos_scale: float = 0.001,
+    poll_hz: float = 200.0,
     encoding: str = "gbk",
   ) -> None:
     self._dll = ctypes.CDLL(dll_path)
     self._host = bytes(host, encoding)
-    # Keys prefixed with "_" are documentation (e.g. "_comment"), not sensors.
+    # Keys prefixed with "_" are documentation (e.g. "_comment"), not body_ids.
     self._body_map = {
       int(k): str(v) for k, v in body_map.items() if not str(k).startswith("_")
     }
     self._scale = float(pos_scale)
+    self._poll_dt = 1.0 / max(poll_hz, 1.0)
     self._lock = threading.Lock()
     self._bodies: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    self._cb_type = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.POINTER(_VrpnTracker))
-    self._cb = self._cb_type(self._on_tracker)
     self._running = False
     self._thread: Optional[threading.Thread] = None
-
-  def _on_tracker(self, _ptr, b) -> None:
-    d = b.contents
-    name = self._body_map.get(int(d.sensor))
-    if name is None:
-      return
-    pos = np.array([d.pos[0] * self._scale, d.pos[1] * self._scale, d.pos[2] * self._scale])
-    quat_xyzw = np.array([d.quat[0], d.quat[1], d.quat[2], d.quat[3]])
-    with self._lock:
-      self._bodies[name] = (pos, quat_xyzw)
 
   def start(self) -> None:
     self._dll.CMVrpnStartExtern()
@@ -176,18 +171,29 @@ class ChingMuSkeletonReader:
       self._dll.CMVrpnEnableLog(False)
     except Exception:  # noqa: BLE001
       pass
-    self._dll.CMPluginConnectServer(self._host)
-    self._dll.CMPluginRegisterTrackerData(self._host, None, self._cb)
     self._running = True
     self._thread = threading.Thread(target=self._loop, daemon=True)
     self._thread.start()
-    print(f"[ChingMu] human skeleton from {self._host.decode(errors='replace')} "
-          f"({len(self._body_map)} segments)")
+    print(f"[ChingMu] polling {len(self._body_map)} skeleton body_ids from "
+          f"{self._host.decode(errors='replace')}")
 
   def _loop(self) -> None:
+    body_pos = (ctypes.c_double * 3)()
+    body_rot = (ctypes.c_double * 4)()  # xyzw
+    timecode = (ctypes.c_int * 1)()
+    tv = _Timeval()
+    s = self._scale
     while self._running:
-      self._dll.CMPluginRegisterTrackerData(self._host, None, self._cb)
-      time.sleep(0.001)
+      for bid, name in self._body_map.items():
+        det = self._dll.CMTrackerExternTC(
+          self._host, bid, timecode, body_pos, body_rot, ctypes.byref(tv)
+        )
+        if det:
+          pos = np.array([body_pos[0] * s, body_pos[1] * s, body_pos[2] * s])
+          quat_xyzw = np.array([body_rot[0], body_rot[1], body_rot[2], body_rot[3]])
+          with self._lock:
+            self._bodies[name] = (pos, quat_xyzw)
+      time.sleep(self._poll_dt)
 
   def get_human_data(self) -> Optional[dict]:
     """Return the GMR `human_data` dict, or None until all segments are seen."""
@@ -197,7 +203,7 @@ class ChingMuSkeletonReader:
       return {k: (p.copy(), q.copy()) for k, (p, q) in self._bodies.items()}
 
   def pending(self) -> tuple[int, int, list[int]]:
-    """(n_seen, n_total, sorted mapped sensor ids not yet received)."""
+    """(n_seen, n_total, sorted mapped body_ids not yet received)."""
     with self._lock:
       have = set(self._bodies)
     missing = sorted(sid for sid, name in self._body_map.items() if name not in have)

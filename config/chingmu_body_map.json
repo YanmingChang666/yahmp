@@ -1,5 +1,5 @@
 {
-  "_comment": "ChingMu human-skeleton sensor id -> GMR smplx body name. Keys are ChingMu VRPN integer sensor ids (from your ChingMu software's segment numbering); values MUST be one of the 14 names GMR's smplx src expects. Keys starting with '_' are ignored (docs). REPLACE the placeholder ids below (0-13) with YOUR ChingMu sensor ids, then run retarget_server_gmr.py --src-human smplx.",
+  "_comment": "ChingMu body_id -> GMR smplx body name. Keys are ChingMu VRPN body_ids from the CMTrackerExternTC polling API (discover them with `retarget_server_gmr.py --probe-poll`); values MUST be one of the 14 names GMR's smplx src expects. Keys starting with '_' are ignored (docs). REPLACE the placeholder body_ids below (0-13) with YOUR ChingMu body_ids, then run retarget_server_gmr.py --src-human smplx.",
   "_mapping_guide_smplx_name_from_chingmu_segment": {
     "pelvis": "Hips",
     "spine3": "Spine2 / Chest (upper spine)",
