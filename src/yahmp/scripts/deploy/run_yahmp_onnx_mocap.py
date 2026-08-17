@@ -60,7 +60,6 @@ from yahmp.scripts.deploy.run_yahmp_onnx_mujoco import (
   PolicySpec,
   _actuator_ids,
   _append_history,
-  _apply_action,
   _build_observation,
   _build_task_scene,
   _configure_camera,
@@ -1042,6 +1041,260 @@ def _run_gui_calibration(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Target smoothing (mirrors run_yahmp_onnx_real.TargetSmoother) + shared step
+# ══════════════════════════════════════════════════════════════════════════════
+class TargetSmoother:
+  """EMA + slew-rate limit on the per-joint position target — a copy of the one
+  in `run_yahmp_onnx_real.py` (kept here to avoid a circular import).
+
+  A YAHMP policy can emit a high-frequency action limit cycle that ideal MuJoCo
+  actuators reproduce as visible limb shaking (while real hardware's latency /
+  friction filters it out). This breaks that limit cycle by smoothing the
+  *commanded* target only — the observation fed back to the policy is untouched,
+  so sim/real observation parity is preserved. `set_params` allows live tuning
+  from the GUI.
+
+    * EMA         y = ema·target + (1 - ema)·y_prev   (ema=1.0 → off/passthrough)
+    * rate limit  |y - y_prev| <= max_rate·control_dt  (max_rate=0 → off)
+  """
+
+  def __init__(self, *, init: np.ndarray, ema: float, max_rate: float, control_dt: float) -> None:
+    self._prev = np.asarray(init, dtype=np.float64).copy()
+    self._control_dt = float(control_dt)
+    self.set_params(ema=ema, max_rate=max_rate)
+
+  def set_params(self, *, ema: float, max_rate: float) -> None:
+    if not 0.0 < ema <= 1.0:
+      raise ValueError(f"--target-ema must be in (0, 1], got {ema}.")
+    if max_rate < 0.0:
+      raise ValueError(f"--target-max-rate must be >= 0, got {max_rate}.")
+    self._ema = float(ema)
+    self._max_step = float(max_rate) * self._control_dt if max_rate > 0.0 else 0.0
+
+  @property
+  def enabled(self) -> bool:
+    return self._ema < 1.0 or self._max_step > 0.0
+
+  def step(self, target: np.ndarray) -> np.ndarray:
+    y = self._ema * np.asarray(target, dtype=np.float64) + (1.0 - self._ema) * self._prev
+    if self._max_step > 0.0:
+      y = self._prev + np.clip(y - self._prev, -self._max_step, self._max_step)
+    self._prev = y
+    return y
+
+
+def _teleop_step(ctx: dict) -> tuple[MotionFrame, float]:
+  """One teleop control step, shared by the headless loop and the tuning GUI.
+
+  obs → ONNX → decode target (mirrors `_apply_action`) → `TargetSmoother` →
+  `data.ctrl` → `mj_step` → optional record. `ctx` bundles the static handles and
+  the mutable loop state (`previous_action`, `history`, `prev_loop_start`,
+  `recorder`); it is mutated in place. Returns `(frame, wall_t0)`.
+  """
+  spec, model, data, reference = ctx["spec"], ctx["model"], ctx["data"], ctx["reference"]
+  jqp, jqv, rqp = ctx["joint_qpos_adr"], ctx["joint_qvel_adr"], ctx["root_qpos_adr"]
+  idx = ctx["action_target_joint_indices"]
+  wall_t0 = time.perf_counter()
+
+  frame = reference.sample(0.0)
+  terms = _term_values(model, data, spec, reference, 0.0, frame, jqp, jqv, ctx["previous_action"])
+  obs = _build_observation(spec, terms, ctx["history"])
+  t_infer0 = time.perf_counter()
+  raw_action = (
+    ctx["session"].run([ctx["output_name"]], {ctx["input_name"]: obs[None, :].astype(np.float32)})[0]
+    .reshape(-1)
+    .astype(np.float32)
+  )
+  infer_ms = (time.perf_counter() - t_infer0) * 1e3
+
+  # Capture the state the policy acted on (pre-step) for the recorder.
+  rec = ctx["recorder"]
+  if rec is not None:
+    actual_joint_pos = np.asarray(data.qpos[jqp], dtype=np.float64).copy()
+    actual_joint_vel = np.asarray(data.qvel[jqv], dtype=np.float64).copy()
+    base_quat = np.asarray(data.qpos[rqp + 3 : rqp + 7], dtype=np.float64).copy()
+
+  # Decode action → per-joint position target (mirrors `_apply_action`), then
+  # smooth the commanded target only (obs above is untouched → sim/real parity).
+  processed = raw_action.astype(np.float64) * spec.action_scale + spec.action_offset
+  target = ctx["default_joint_pos"].copy()
+  if spec.action_semantics == "residual_joint_position":
+    target[idx] = frame.joint_pos[idx] + processed
+  else:
+    target[idx] = processed
+  target = ctx["smoother"].step(target)
+  data.ctrl[ctx["action_actuator_ids"]] = target[idx]
+
+  for _ in range(ctx["steps_per_control"]):
+    mujoco.mj_step(model, data)
+
+  if rec is not None:
+    step_ms = (time.perf_counter() - wall_t0) * 1e3
+    rec.step(
+      wall_time=wall_t0,
+      ref_joint_pos=frame.joint_pos,
+      target_joint_pos=target,
+      actual_joint_pos=actual_joint_pos,
+      actual_joint_vel=actual_joint_vel,
+      quat=base_quat,
+      ang_vel=terms["base_ang_vel"],
+      proj_grav=terms["projected_gravity"],
+      raw_action=raw_action,
+      root_cmd=terms["command"][2 * ctx["n"] : 2 * ctx["n"] + 6],
+      timing=dict(
+        infer_ms=infer_ms,
+        step_ms=step_ms,
+        period_ms=(wall_t0 - ctx["prev_loop_start"]) * 1e3 if ctx["prev_loop_start"] is not None else float("nan"),
+        overrun=step_ms > spec.control_dt * 1e3,
+      ),
+    )
+    if ctx["record_steps"] > 0 and rec.count >= ctx["record_steps"]:
+      print("[Recorder] reached --record-steps limit, stopping recording.")
+      rec.close()
+      ctx["recorder"] = None
+
+  ctx["prev_loop_start"] = wall_t0
+  ctx["previous_action"] = raw_action
+  next_frame = reference.sample(0.0)
+  next_terms = _term_values(model, data, spec, reference, 0.0, next_frame, jqp, jqv, ctx["previous_action"])
+  _append_history(spec, ctx["history"], next_terms)
+  return frame, wall_t0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Live tuning GUI (policy in the loop) — dial root R/P/Y + height + smoothing
+# ══════════════════════════════════════════════════════════════════════════════
+def _run_gui_teleop(
+  ctx: dict,
+  viewer_cfg,
+  source,
+  *,
+  calibration: "MocapCalibration",
+  out_path: str,
+  target_ema: float,
+  target_max_rate: float,
+) -> None:
+  """Slider GUI to tune root Roll/Pitch/Yaw + height AND target smoothing LIVE
+  while the policy runs. Each ~50 Hz tick runs a full `_teleop_step`, so you watch
+  the tuned params drive the actual policy-controlled robot — the exact setup you
+  verify before sim2real. R/P/Y + height mutate the loaded `MocapCalibration`
+  (LiveReference re-reads it every frame); EMA / max-rate mutate the
+  `TargetSmoother`. Save writes the `--mocap-calibration` JSON and prints the
+  matching `--target-ema` / `--target-max-rate` flags for the deploy command.
+  """
+  import tkinter as tk
+
+  import mujoco.viewer as mujoco_viewer
+
+  spec, model, data = ctx["spec"], ctx["model"], ctx["data"]
+  smoother = ctx["smoother"]
+
+  root = tk.Tk()
+  root.title("YAHMP teleop — live tuning (root R/P/Y + smoothing)")
+  roll_v = tk.DoubleVar(value=float(np.degrees(calibration.root_rpy_offset[0])))
+  pitch_v = tk.DoubleVar(value=float(np.degrees(calibration.root_rpy_offset[1])))
+  yaw_v = tk.DoubleVar(value=float(np.degrees(calibration.root_rpy_offset[2])))
+  height_v = tk.DoubleVar(value=float(calibration.root_height_target))
+  ema_v = tk.DoubleVar(value=float(target_ema))
+  rate_v = tk.DoubleVar(value=float(target_max_rate))
+  status_v = tk.StringVar(value="policy running — dial params, Save when stable")
+  readout_v = tk.StringVar(value="")
+
+  def _slider(label, var, lo, hi, res):
+    row = tk.Frame(root)
+    row.pack(fill="x", padx=8, pady=1)
+    tk.Label(row, text=label, width=11, anchor="w").pack(side="left")
+    tk.Scale(row, variable=var, from_=lo, to=hi, resolution=res, orient="horizontal", length=320).pack(
+      side="left", fill="x", expand=True
+    )
+
+  _slider("Roll °", roll_v, -30.0, 30.0, 0.5)
+  _slider("Pitch °", pitch_v, -30.0, 30.0, 0.5)
+  _slider("Yaw °", yaw_v, -60.0, 60.0, 0.5)
+  _slider("Height m", height_v, 0.50, 1.00, 0.005)
+  _slider("Target EMA", ema_v, 0.05, 1.0, 0.05)
+  _slider("Max rate r/s", rate_v, 0.0, 20.0, 0.5)
+
+  def _sync_from_sliders():
+    calibration.root_rpy_offset = np.deg2rad([roll_v.get(), pitch_v.get(), yaw_v.get()])
+    calibration.root_height_target = float(height_v.get())
+    smoother.set_params(ema=float(ema_v.get()), max_rate=float(rate_v.get()))
+
+  def _reset_rpy():
+    roll_v.set(0.0)
+    pitch_v.set(0.0)
+    yaw_v.set(0.0)
+    status_v.set("root R/P/Y reset to 0")
+
+  def _save():
+    _sync_from_sliders()
+    out = {
+      "_comment": "Neutral-pose calibration; root R/P/Y + height tuned live via the teleop GUI.",
+      "joint_names": list(spec.joint_names),
+      "joint_offset_rad": [float(v) for v in calibration.joint_offset],
+      "root_quat_neutral_wxyz": [float(v) for v in calibration.root_quat_neutral],
+      "root_height_neutral": float(calibration.root_height_neutral),
+      "root_height_target": float(calibration.root_height_target),
+      "root_rpy_offset_rad": [float(v) for v in calibration.root_rpy_offset],
+    }
+    p = Path(out_path)
+    if p.parent and not p.parent.exists():
+      p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(out, indent=2))
+    flags = f"--target-ema {ema_v.get():.2f} --target-max-rate {rate_v.get():.1f}"
+    status_v.set(f"saved → {out_path}   |  deploy smoothing: {flags}")
+    print(f"[Tune] saved calibration → {out_path}")
+    print(f"[Tune] for sim2real, add to the deploy command:  {flags}")
+
+  btns = tk.Frame(root)
+  btns.pack(fill="x", padx=8, pady=6)
+  tk.Button(btns, text="Save calibration", command=_save).pack(side="left")
+  tk.Button(btns, text="Reset R/P/Y", command=_reset_rpy).pack(side="left", padx=4)
+  tk.Label(root, textvariable=readout_v, anchor="w", justify="left", font=("TkFixedFont", 10)).pack(
+    fill="x", padx=8
+  )
+  tk.Label(root, textvariable=status_v, anchor="w", fg="#0a5").pack(fill="x", padx=8, pady=4)
+
+  viewer = mujoco_viewer.launch_passive(model, data)
+  _configure_camera(viewer, model, spec.root_body_name, viewer_cfg)
+  print("[Tune] GUI open. Policy is running — dial Roll/Pitch/Yaw/Height + smoothing, Save when happy.")
+
+  def _tick():
+    if not viewer.is_running():
+      root.destroy()
+      return
+    _sync_from_sliders()
+    frame, _ = _teleop_step(ctx)
+    viewer.sync()
+    er, ep, ey = np.degrees(_quat_roll_pitch_yaw(frame.root_quat_w))
+    bq = data.qpos[ctx["root_qpos_adr"] + 3 : ctx["root_qpos_adr"] + 7]
+    br, bp, by = np.degrees(_quat_roll_pitch_yaw(bq))
+    readout_v.set(
+      f"cmd root r/p/y = {er:+6.1f}/{ep:+6.1f}/{ey:+6.1f}°   "
+      f"base r/p/y = {br:+6.1f}/{bp:+6.1f}/{by:+6.1f}°   h={frame.root_pos_w[2]:.3f} m"
+    )
+    root.after(int(spec.control_dt * 1000), _tick)
+
+  def _on_close():
+    try:
+      viewer.close()
+    finally:
+      root.destroy()
+
+  root.protocol("WM_DELETE_WINDOW", _on_close)
+  root.after(0, _tick)
+  try:
+    root.mainloop()
+  finally:
+    try:
+      viewer.close()
+    except Exception:  # noqa: BLE001 - viewer may already be closed
+      pass
+    if ctx["recorder"] is not None and ctx["recorder"].count > 0:
+      ctx["recorder"].close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main loop
 # ══════════════════════════════════════════════════════════════════════════════
 def run(
@@ -1060,6 +1313,9 @@ def run(
   redis_kwargs: Optional[dict] = None,
   record: str = "",
   record_steps: int = 0,
+  target_ema: float = 1.0,
+  target_max_rate: float = 0.0,
+  tune: bool = False,
 ) -> None:
   redis_kwargs = redis_kwargs or {}
   spec = PolicySpec.from_onnx(onnx_path)
@@ -1163,24 +1419,26 @@ def run(
   )
   mujoco.mj_forward(model, data)
 
-  previous_action = np.zeros(spec.action_dim, dtype=np.float32)
-  terms = _term_values(
-    model, data, spec, reference, 0.0, initial_frame,
-    joint_qpos_adr, joint_qvel_adr, previous_action,
-  )
-  history = _initialize_history(spec, terms)
-  steps_per_control = int(round(spec.control_dt / spec.physics_dt))
+  n = len(spec.joint_names)
+  default_joint_pos = np.asarray(spec.default_joint_pos, dtype=np.float64)
 
-  print(f"[INFO] ONNX providers: {providers}")
-  print(f"[INFO] Teleop source: {source_kind}  control_dt={spec.control_dt:.4f}s")
+  # ── Target smoother (breaks the sim2sim high-freq action limit cycle) ──────
+  smoother = TargetSmoother(
+    init=default_joint_pos, ema=target_ema, max_rate=target_max_rate, control_dt=spec.control_dt
+  )
+  if smoother.enabled:
+    print(
+      f"[INFO] target smoothing ON: ema={target_ema:.2f} max_rate={target_max_rate:.2f} rad/s "
+      f"({target_max_rate * spec.control_dt * 180.0 / np.pi:.1f}°/step)"
+    )
+  else:
+    print("[INFO] target smoothing OFF (raw policy target sent to actuators).")
 
   # ── Sim2sim data recorder (optional; --record) ─────────────────────────────
   # Same CSV/meta format as run_yahmp_onnx_real.py --record, so the identical
   # `run_yahmp_onnx_recorder analyze` / `replay_yahmp_onnx_sim` tools apply and a
   # sim run can be compared column-for-column against a real one (e.g. to see why
   # MuJoCo shakes while the robot does not).
-  n = len(spec.joint_names)
-  default_joint_pos = np.asarray(spec.default_joint_pos, dtype=np.float64)
   recorder = (
     Sim2RealRecorder(
       record,
@@ -1195,6 +1453,8 @@ def run(
         vel_smoothing=vel_smoothing,
         mocap_calibration=mocap_calibration or None,
         calibrated=bool(calibration is not None),
+        target_ema=target_ema,
+        target_max_rate=target_max_rate,
         control_dt=spec.control_dt,
         action_semantics=spec.action_semantics,
       ),
@@ -1203,97 +1463,72 @@ def run(
     else None
   )
 
+  previous_action = np.zeros(spec.action_dim, dtype=np.float32)
+  terms = _term_values(
+    model, data, spec, reference, 0.0, initial_frame,
+    joint_qpos_adr, joint_qvel_adr, previous_action,
+  )
+  history = _initialize_history(spec, terms)
+
+  # Shared loop context (static handles + mutable state) so the per-step logic
+  # lives in exactly one place (`_teleop_step`), used by both the headless loop
+  # and the tuning GUI.
+  ctx = dict(
+    model=model, data=data, spec=spec, reference=reference,
+    session=session, input_name=input_name, output_name=output_name,
+    joint_qpos_adr=joint_qpos_adr, joint_qvel_adr=joint_qvel_adr, root_qpos_adr=root_qpos_adr,
+    action_actuator_ids=action_actuator_ids,
+    action_target_joint_indices=action_target_joint_indices,
+    steps_per_control=int(round(spec.control_dt / spec.physics_dt)),
+    default_joint_pos=default_joint_pos, n=n,
+    smoother=smoother, recorder=recorder, record_steps=record_steps,
+    previous_action=previous_action, history=history, prev_loop_start=None,
+  )
+
+  print(f"[INFO] ONNX providers: {providers}")
+  print(f"[INFO] Teleop source: {source_kind}  control_dt={spec.control_dt:.4f}s")
+
   import mujoco.viewer as mujoco_viewer
 
-  prev_loop_start: Optional[float] = None
+  # ── Live tuning GUI (policy in the loop): root R/P/Y + height + smoothing ───
+  if tune:
+    if calibration is None:
+      raise SystemExit(
+        "--tune adjusts an existing calibration; pass --mocap-calibration <file> "
+        "(build one first with --mode calibrate)."
+      )
+    have_gui = True
+    try:  # probe tkinter + a usable display before committing
+      import tkinter as _tk
+
+      _probe = _tk.Tk()
+      _probe.withdraw()
+      _probe.destroy()
+    except Exception as exc:  # noqa: BLE001 - ImportError or TclError (no $DISPLAY)
+      have_gui = False
+      print(f"[Tune] GUI unavailable ({exc}); falling back to headless teleop.")
+    if have_gui:
+      try:
+        _run_gui_teleop(
+          ctx, viewer_cfg, source,
+          calibration=calibration, out_path=mocap_calibration,
+          target_ema=target_ema, target_max_rate=target_max_rate,
+        )
+      finally:
+        source.stop()
+      return
+
   with mujoco_viewer.launch_passive(model, data) as viewer:
     _configure_camera(viewer, model, spec.root_body_name, viewer_cfg)
     try:
       while viewer.is_running():
-        wall_t0 = time.perf_counter()
-
-        # OBSERVATION DIMS (g1_yahmp, num_joints N=29) — total obs = 1727:
-        #   command 64 (=2N+6) + base_ang_vel 3 + projected_gravity 3 +
-        #   joint_pos N + joint_vel N + actions N(=action_dim) + history 1570
-        #   history 1570 = 10 frames × 157-dim block
-        #     (block = command 64 + base_ang_vel 3 + proj_gravity 3 + joint_pos N + joint_vel N + actions N)
-        #   command 64 = joint_pos_ref N | joint_vel_ref N | anchor_lin_vel_xy 2 |
-        #                anchor_ang_vel_yaw 1 | root_height 1 | root_roll,pitch 2
-        frame = reference.sample(0.0)  # latest mocap pose -> MotionFrame (see LiveReference.sample)
-        terms = _term_values(  # dict of the 6 current terms above (robot state from sim + command from mocap)
-          model, data, spec, reference, 0.0, frame,
-          joint_qpos_adr, joint_qvel_adr, previous_action,
-        )
-        obs = _build_observation(spec, terms, history)  # (1727,) — concatenated in spec.observation_terms order
-        t_infer0 = time.perf_counter()
-        raw_action = (
-          session.run([output_name], {input_name: obs[None, :].astype(np.float32)})[0]
-          .reshape(-1)
-          .astype(np.float32)  # (29,) = action_dim
-        )
-        infer_ms = (time.perf_counter() - t_infer0) * 1e3
-
-        # Capture the state the policy acted on (pre-step) + the target it commands.
-        if recorder is not None:
-          actual_joint_pos = np.asarray(data.qpos[joint_qpos_adr], dtype=np.float64).copy()
-          actual_joint_vel = np.asarray(data.qvel[joint_qvel_adr], dtype=np.float64).copy()
-          base_quat = np.asarray(
-            data.qpos[root_qpos_adr + 3 : root_qpos_adr + 7], dtype=np.float64
-          ).copy()  # wxyz
-
-        _apply_action(
-          data, spec, raw_action, frame, action_actuator_ids, action_target_joint_indices
-        )
-        # Read the position targets back from ctrl (DRY: exactly what _apply_action sent).
-        if recorder is not None:
-          target_joint_pos = default_joint_pos.copy()
-          target_joint_pos[action_target_joint_indices] = np.asarray(
-            data.ctrl[action_actuator_ids], dtype=np.float64
-          )
-
-        for _ in range(steps_per_control):
-          mujoco.mj_step(model, data)
-
-        if recorder is not None:
-          step_ms = (time.perf_counter() - wall_t0) * 1e3
-          recorder.step(
-            wall_time=wall_t0,
-            ref_joint_pos=frame.joint_pos,                 # mocap reference (the human)
-            target_joint_pos=target_joint_pos,             # position setpoint sent to actuators
-            actual_joint_pos=actual_joint_pos,             # measured joint position (sim)
-            actual_joint_vel=actual_joint_vel,             # measured joint velocity (sim)
-            quat=base_quat,                                # pelvis orientation wxyz
-            ang_vel=terms["base_ang_vel"],                 # base angular velocity, body frame
-            proj_grav=terms["projected_gravity"],
-            raw_action=raw_action,                         # policy output (chatter shows here)
-            root_cmd=terms["command"][2 * n : 2 * n + 6],  # [vx,vy,wyaw,height,roll,pitch]
-            timing=dict(
-              infer_ms=infer_ms,
-              step_ms=step_ms,
-              period_ms=(wall_t0 - prev_loop_start) * 1e3 if prev_loop_start is not None else float("nan"),
-              overrun=step_ms > spec.control_dt * 1e3,
-            ),
-          )
-          if record_steps > 0 and recorder.count >= record_steps:
-            print("[Recorder] reached --record-steps limit, stopping recording.")
-            recorder.close()
-            recorder = None
-        prev_loop_start = wall_t0
-
-        previous_action = raw_action
-        next_frame = reference.sample(0.0)
-        next_terms = _term_values(
-          model, data, spec, reference, 0.0, next_frame,
-          joint_qpos_adr, joint_qvel_adr, previous_action,
-        )
-        _append_history(spec, history, next_terms)
-
+        _, wall_t0 = _teleop_step(ctx)
         viewer.sync()
         time.sleep(max(0.0, spec.control_dt - (time.perf_counter() - wall_t0)))
     finally:
       source.stop()
-      if recorder is not None and recorder.count > 0:
-        recorder.close()
+      if ctx["recorder"] is not None and ctx["recorder"].count > 0:
+        ctx["recorder"].close()
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -1347,6 +1582,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     "Analyze with `run_yahmp_onnx_recorder analyze` or replay with replay_yahmp_onnx_sim.",
   )
   p.add_argument("--record-steps", type=int, default=0, help="Max control steps to record (0 = unlimited).")
+  # Target smoothing (teleop) — same knobs as run_yahmp_onnx_real.py; breaks the
+  # high-frequency action limit cycle that makes the sim2sim robot shake.
+  p.add_argument("--target-ema", type=float, default=1.0, help="EMA on the commanded target: weight of the new sample each step, (0,1]. 1.0=off. Try 0.3-0.5 to suppress action chatter.")
+  p.add_argument("--target-max-rate", type=float, default=0.0, help="Per-joint slew-rate cap on the target in rad/s. 0=off. e.g. 6.0 -> ~6.9 deg per 20ms step.")
+  p.add_argument("--tune", action="store_true", help="Teleop only: open a slider GUI to dial root roll/pitch/yaw + height + target smoothing LIVE while the policy runs, and Save to --mocap-calibration. Needs a display + tkinter.")
   return p
 
 
@@ -1410,6 +1650,9 @@ def main() -> None:
     redis_kwargs=redis_kwargs,
     record=str(args.record),
     record_steps=int(args.record_steps),
+    target_ema=float(args.target_ema),
+    target_max_rate=float(args.target_max_rate),
+    tune=bool(args.tune),
   )
 
 
