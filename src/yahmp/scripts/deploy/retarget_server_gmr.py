@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import os
 import threading
 import time
 from typing import Optional
@@ -266,7 +267,44 @@ def _probe_sensors(dll_path: str, host: str, seconds: float, pos_scale: float,
     for sid in sorted(seen):
       x, y, z = seen[sid]
       print(f"   {sid:4d}  ({x:+.3f}, {y:+.3f}, {z:+.3f})")
-  print("[Probe] map these ids to the 14 smplx names in --body-map, then drop --probe.")
+  print("[Probe] NOTE: this callback API returns RIGID BODIES. If you see only a few "
+        "(not ~14 skeleton joints), your human skeleton is on the polling API — "
+        "run --probe-poll instead.")
+  os._exit(0)  # skip interpreter teardown; the VRPN C thread segfaults on shutdown
+
+
+def _probe_poll(dll_path: str, host: str, max_body: int, seconds: float,
+                pos_scale: float, encoding: str = "gbk") -> None:
+  """Enumerate ChingMu body poses via the CMTrackerExternTC POLLING API (the one
+  TTRL's WaistBodyPollerLive uses). Human-skeleton segments usually live here,
+  indexed by body_id, when the tracker-data callback only shows rigid bodies."""
+  dll = ctypes.CDLL(dll_path)
+  hostb = bytes(host, encoding)
+  dll.CMVrpnStartExtern()
+  try:
+    dll.CMVrpnEnableLog(False)
+  except Exception:  # noqa: BLE001
+    pass
+  body_pos = (ctypes.c_double * 3)()
+  body_rot = (ctypes.c_double * 4)()  # xyzw
+  timecode = (ctypes.c_int * 1)()
+  tv = _Timeval()
+  print(f"[ProbePoll] polling body_id 0..{max_body} for {seconds:.0f}s — stand in view…")
+  seen: dict[int, tuple] = {}
+  t0 = time.time()
+  while time.time() - t0 < seconds:
+    for bid in range(max_body + 1):
+      det = dll.CMTrackerExternTC(hostb, bid, timecode, body_pos, body_rot, ctypes.byref(tv))
+      if det:
+        seen[bid] = (body_pos[0] * pos_scale, body_pos[1] * pos_scale, body_pos[2] * pos_scale)
+    time.sleep(0.05)
+    print(f"\r[ProbePoll] detected body_ids: {sorted(seen)}   ", end="", flush=True)
+  print(f"\n[ProbePoll] {len(seen)} body_ids detected (id -> position m):")
+  for bid in sorted(seen):
+    x, y, z = seen[bid]
+    print(f"   body_id {bid:3d}  ({x:+.3f}, {y:+.3f}, {z:+.3f})")
+  print("[ProbePoll] if ~14+ ids appear, that's your skeleton — map them in --body-map.")
+  os._exit(0)
 
 
 def _resolve_gmr_class(pkg):
@@ -302,6 +340,10 @@ def run(args: argparse.Namespace) -> None:
   # Sensor discovery needs neither GMR nor a body-map — do it first and exit.
   if args.probe:
     _probe_sensors(args.chingmu_dll, args.chingmu_host, args.probe_seconds, args.pos_scale)
+    return
+  if args.probe_poll:
+    _probe_poll(args.chingmu_dll, args.chingmu_host, args.probe_max_body,
+                args.probe_seconds, args.pos_scale)
     return
   if not args.body_map:
     raise SystemExit("--body-map is required (or use --probe to discover sensor ids).")
@@ -413,7 +455,9 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--chingmu-host", type=str, required=True, help="e.g. MCAvatar@192.168.123.112")
   p.add_argument("--chingmu-dll", type=str, required=True, help="Path to libCMVrpn.so.")
   p.add_argument("--body-map", type=str, default=None, help="JSON {chingmu_sensor_id: gmr_body_name}. Required unless --probe.")
-  p.add_argument("--probe", action="store_true", help="Print live ChingMu sensor ids and exit (to build --body-map). No GMR needed.")
+  p.add_argument("--probe", action="store_true", help="Print live ChingMu rigid-body sensor ids (tracker-data callback) and exit.")
+  p.add_argument("--probe-poll", action="store_true", help="Enumerate body_ids via the CMTrackerExternTC polling API (where the skeleton usually is) and exit.")
+  p.add_argument("--probe-max-body", type=int, default=40, help="Highest body_id to poll in --probe-poll.")
   p.add_argument("--probe-seconds", type=float, default=15.0)
   p.add_argument("--pos-scale", type=float, default=0.001, help="ChingMu position units -> metres (mm=0.001).")
   p.add_argument("--robot", type=str, default="unitree_g1", help="GMR tgt_robot key (ROBOT_XML_DICT).")
