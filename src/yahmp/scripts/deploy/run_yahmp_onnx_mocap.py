@@ -562,6 +562,121 @@ class NpzMockSource:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Source C — Redis (GMR-retargeted robot pose, TWIST2-style two-process teleop)
+# ══════════════════════════════════════════════════════════════════════════════
+class RedisMocapSource:
+  """Reads GMR-retargeted robot poses from redis (published by
+  `retarget_server_gmr.py`) and pushes them into a `MocapState`, so the policy
+  loop is byte-for-byte identical to any other source. This is the deploy half
+  of the TWIST2-style two-process retargeting architecture:
+
+      ChingMu human skeleton ─► retarget_server_gmr (GMR, `gmr` env) ─► redis
+                                                                          │
+      MocapState ◄── RedisMocapSource ◄─────────────────────────────────┘
+
+  Redis payload (JSON string at `key`), robot-space, MuJoCo conventions:
+      {"seq": int, "t": float,
+       "root_pos":  [x, y, z],           # pelvis world pos (m), ground-offset by GMR
+       "root_quat": [w, x, y, z],
+       "joint_pos": {joint_name: rad, ...},
+       "joint_vel": {joint_name: rad/s, ...} | null,
+       "detected":  bool}
+
+  Joints are resolved **by name** into `joint_names` order, so ordering is
+  unambiguous and no `--joint-order` is needed (or should be passed) for
+  `--source redis`. `client` is injectable for testing.
+  """
+
+  def __init__(
+    self,
+    state: MocapState,
+    joint_names: list[str] | tuple[str, ...],
+    *,
+    host: str = "localhost",
+    port: int = 6379,
+    db: int = 0,
+    key: str = "yahmp:mocap:pose",
+    poll_hz: float = 200.0,
+    client=None,
+  ) -> None:
+    self._state = state
+    self._names = list(joint_names)
+    self._key = key
+    self._poll_dt = 1.0 / max(poll_hz, 1.0)
+    if client is None:
+      import redis  # lazy: only required for --source redis
+
+      client = redis.Redis(host=host, port=port, db=db)
+    self._client = client
+    self._running = False
+    self._thread: Optional[threading.Thread] = None
+    self._last_seq: Optional[int] = None
+
+  def _read_once(self) -> bool:
+    """Poll the key once; push into MocapState if a new detected frame is there."""
+    raw = self._client.get(self._key)
+    if raw is None:
+      return False
+    if isinstance(raw, (bytes, bytearray)):
+      raw = raw.decode("utf-8")
+    try:
+      msg = json.loads(raw)
+    except (ValueError, TypeError):
+      return False  # skip a torn/partial write; next poll gets a clean frame
+    if not msg.get("detected", True):
+      return False
+    seq = msg.get("seq")
+    if seq is not None and seq == self._last_seq:
+      return False  # no new frame since last poll
+    self._last_seq = seq
+
+    root_pos = np.asarray(msg["root_pos"], dtype=np.float64)
+    root_quat = np.asarray(msg["root_quat"], dtype=np.float64)  # wxyz
+    jp = msg["joint_pos"]
+    try:
+      joint_pos = np.asarray([jp[n] for n in self._names], dtype=np.float64)
+    except KeyError as exc:
+      raise KeyError(
+        f"redis joint_pos is missing policy joint {exc}. The retarget server must "
+        f"publish all {len(self._names)} joints in spec.joint_names."
+      ) from exc
+    jv = msg.get("joint_vel")
+    joint_vel = (
+      np.asarray([jv.get(n, 0.0) for n in self._names], dtype=np.float64) if jv else None
+    )
+    self._state.update(root_pos, root_quat, joint_pos, joint_vel=joint_vel)
+    return True
+
+  def start(self) -> None:
+    try:
+      self._client.ping()
+    except Exception as exc:  # noqa: BLE001 - surface a clear message, not a stack
+      raise SystemExit(
+        f"Cannot reach redis at key {self._key!r}: {exc}. Start the retarget "
+        "server (retarget_server_gmr.py) and a redis server first."
+      ) from exc
+    self._running = True
+    self._thread = threading.Thread(target=self._loop, daemon=True)
+    self._thread.start()
+    print(f"[Redis] polling {self._key!r} @ {1 / self._poll_dt:.0f} Hz for GMR poses")
+
+  def _loop(self) -> None:
+    while self._running:
+      try:
+        self._read_once()
+      except KeyError:
+        raise
+      except Exception:  # noqa: BLE001 - transient redis hiccup; keep last pose
+        pass
+      time.sleep(self._poll_dt)
+
+  def stop(self) -> None:
+    self._running = False
+    if self._thread:
+      self._thread.join(timeout=0.5)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Kinematic full-body replay (no policy) — mocap → MuJoCo qpos, for validation
 # ══════════════════════════════════════════════════════════════════════════════
 def _run_kinematic_replay(
@@ -941,7 +1056,9 @@ def run(
   vel_smoothing: float,
   mocap_calibration: str = "",
   calibrate_height_target: float = 0.793,
+  redis_kwargs: Optional[dict] = None,
 ) -> None:
+  redis_kwargs = redis_kwargs or {}
   spec = PolicySpec.from_onnx(onnx_path)
   spec.validate()
 
@@ -967,6 +1084,8 @@ def run(
     source = NpzMockSource(state, spec, npz_clip)
   elif source_kind == "chingmu":
     source = ChingMuMocapSource(state, **chingmu_kwargs)
+  elif source_kind == "redis":
+    source = RedisMocapSource(state, spec.joint_names, **redis_kwargs)
   else:
     raise ValueError(f"Unknown --source {source_kind!r}.")
   source.start()
@@ -1100,7 +1219,7 @@ def _build_argparser() -> argparse.ArgumentParser:
   p = argparse.ArgumentParser(description="Real-time mocap teleoperation of a YAHMP ONNX policy (sim2sim).")
   p.add_argument("--onnx-path", type=Path, required=True)
   p.add_argument("--task-id", type=str, required=True)
-  p.add_argument("--source", choices=("npz", "chingmu"), default="npz")
+  p.add_argument("--source", choices=("npz", "chingmu", "redis"), default="npz")
   p.add_argument(
     "--mode",
     choices=("teleop", "replay", "calibrate"),
@@ -1132,6 +1251,12 @@ def _build_argparser() -> argparse.ArgumentParser:
     default=None,
     help="JSON list of ChingMu joint names in stream order; mapped to the policy's joint_names.",
   )
+  # Redis (GMR-retargeted robot pose from retarget_server_gmr.py)
+  p.add_argument("--redis-host", type=str, default="localhost")
+  p.add_argument("--redis-port", type=int, default=6379)
+  p.add_argument("--redis-db", type=int, default=0)
+  p.add_argument("--redis-key", type=str, default="yahmp:mocap:pose")
+  p.add_argument("--redis-poll-hz", type=float, default=200.0)
   return p
 
 
@@ -1168,6 +1293,18 @@ def main() -> None:
       pos_scale=args.pos_scale,
     )
 
+  redis_kwargs = {}
+  if args.source == "redis":
+    if joint_order is not None:
+      raise SystemExit("--source redis resolves joints by name; do not pass --joint-order.")
+    redis_kwargs = dict(
+      host=args.redis_host,
+      port=args.redis_port,
+      db=args.redis_db,
+      key=args.redis_key,
+      poll_hz=args.redis_poll_hz,
+    )
+
   run(
     onnx_path=args.onnx_path.expanduser().resolve(),
     task_id=str(args.task_id),
@@ -1180,6 +1317,7 @@ def main() -> None:
     vel_smoothing=float(args.vel_smoothing),
     mocap_calibration=str(args.mocap_calibration),
     calibrate_height_target=float(args.calibrate_height_target),
+    redis_kwargs=redis_kwargs,
   )
 
 

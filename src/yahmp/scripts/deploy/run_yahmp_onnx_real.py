@@ -54,6 +54,7 @@ from yahmp.scripts.deploy.run_yahmp_onnx_mocap import (
   MocapCalibration,
   MocapState,
   NpzMockSource,
+  RedisMocapSource,
   capture_calibration,
 )
 from yahmp.scripts.deploy.run_yahmp_onnx_recorder import Sim2RealRecorder
@@ -392,7 +393,9 @@ def run(
   dry_run: bool,
   record: str = "",
   record_steps: int = 0,
+  redis_kwargs: Optional[dict] = None,
 ) -> None:
+  redis_kwargs = redis_kwargs or {}
   spec = PolicySpec.from_onnx(onnx_path)
   spec.validate()
   n = len(spec.joint_names)
@@ -416,6 +419,8 @@ def run(
     source = NpzMockSource(state, spec, npz_clip)
   elif source_kind == "chingmu":
     source = ChingMuMocapSource(state, **chingmu_kwargs)
+  elif source_kind == "redis":
+    source = RedisMocapSource(state, spec.joint_names, **redis_kwargs)
   else:
     raise ValueError(f"Unknown --source {source_kind!r}.")
   source.start()
@@ -585,7 +590,7 @@ def _build_argparser() -> argparse.ArgumentParser:
   p = argparse.ArgumentParser(description="Deploy a YAHMP ONNX policy on a real Unitree G1 (mocap teleop).")
   p.add_argument("--onnx-path", type=Path, required=True)
   p.add_argument("--net", dest="net_iface", type=str, required=True, help="DDS network interface, e.g. enp4s0.")
-  p.add_argument("--source", choices=("npz", "chingmu"), default="chingmu")
+  p.add_argument("--source", choices=("npz", "chingmu", "redis"), default="chingmu")
   p.add_argument("--ort-provider", choices=("auto", "cpu", "cuda"), default="cpu")
   p.add_argument("--vel-smoothing", type=float, default=0.7)
   p.add_argument("--kp-scale", type=float, default=1.0, help="Scale trained Kp (start small, e.g. 0.25).")
@@ -613,6 +618,12 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--num-joints", type=int, default=None)
   p.add_argument("--pos-scale", type=float, default=0.001)
   p.add_argument("--joint-order", type=Path, default=None)
+  # Redis (GMR-retargeted robot pose from retarget_server_gmr.py)
+  p.add_argument("--redis-host", type=str, default="localhost")
+  p.add_argument("--redis-port", type=int, default=6379)
+  p.add_argument("--redis-db", type=int, default=0)
+  p.add_argument("--redis-key", type=str, default="yahmp:mocap:pose")
+  p.add_argument("--redis-poll-hz", type=float, default=200.0)
   return p
 
 
@@ -650,6 +661,18 @@ def main() -> None:
       pos_scale=args.pos_scale,
     )
 
+  redis_kwargs = {}
+  if args.source == "redis":
+    if joint_order is not None:
+      raise SystemExit("--source redis resolves joints by name; do not pass --joint-order.")
+    redis_kwargs = dict(
+      host=args.redis_host,
+      port=args.redis_port,
+      db=args.redis_db,
+      key=args.redis_key,
+      poll_hz=args.redis_poll_hz,
+    )
+
   run(
     onnx_path=args.onnx_path.expanduser().resolve(),
     net_iface=str(args.net_iface),
@@ -673,6 +696,7 @@ def main() -> None:
     dry_run=bool(args.dry_run),
     record=str(args.record),
     record_steps=int(args.record_steps),
+    redis_kwargs=redis_kwargs,
   )
 
 
