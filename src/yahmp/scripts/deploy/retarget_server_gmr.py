@@ -195,6 +195,13 @@ class ChingMuSkeletonReader:
         return None
       return {k: (p.copy(), q.copy()) for k, (p, q) in self._bodies.items()}
 
+  def pending(self) -> tuple[int, int, list[int]]:
+    """(n_seen, n_total, sorted mapped sensor ids not yet received)."""
+    with self._lock:
+      have = set(self._bodies)
+    missing = sorted(sid for sid, name in self._body_map.items() if name not in have)
+    return len(have), len(self._body_map), missing
+
   def stop(self) -> None:
     self._running = False
     if self._thread:
@@ -343,11 +350,20 @@ def run(args: argparse.Namespace) -> None:
   prev_t: Optional[float] = None
   default_q: Optional[np.ndarray] = None
   ramp_step = 0
+  last_warn = 0.0
   try:
     while True:
       t_loop = time.perf_counter()
       human = reader.get_human_data()
       if human is None:
+        if t_loop - last_warn > 2.0:
+          n_have, n_total, missing = reader.pending()
+          print(
+            f"\r[GMR] waiting for ChingMu: have {n_have}/{n_total} segments; "
+            f"missing sensor ids {missing} — fix these in --body-map    ",
+            end="", flush=True,
+          )
+          last_warn = t_loop
         time.sleep(dt_nominal)
         continue
 
