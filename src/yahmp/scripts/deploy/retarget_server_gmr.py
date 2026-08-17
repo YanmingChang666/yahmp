@@ -147,7 +147,10 @@ class ChingMuSkeletonReader:
   ) -> None:
     self._dll = ctypes.CDLL(dll_path)
     self._host = bytes(host, encoding)
-    self._body_map = {int(k): str(v) for k, v in body_map.items()}
+    # Keys prefixed with "_" are documentation (e.g. "_comment"), not sensors.
+    self._body_map = {
+      int(k): str(v) for k, v in body_map.items() if not str(k).startswith("_")
+    }
     self._scale = float(pos_scale)
     self._lock = threading.Lock()
     self._bodies: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -220,6 +223,45 @@ def robot_joint_layout(xml_path: str):
 # ══════════════════════════════════════════════════════════════════════════════
 # Main retarget loop
 # ══════════════════════════════════════════════════════════════════════════════
+def _probe_sensors(dll_path: str, host: str, seconds: float, pos_scale: float,
+                   encoding: str = "gbk") -> None:
+  """Print every ChingMu VRPN sensor id seen (with position) so you can map ids
+  to body segments — wiggle a limb and watch which id's position changes."""
+  dll = ctypes.CDLL(dll_path)
+  hostb = bytes(host, encoding)
+  seen: dict[int, tuple] = {}
+  lock = threading.Lock()
+  cb_type = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.POINTER(_VrpnTracker))
+
+  def _cb(_ptr, b):
+    d = b.contents
+    with lock:
+      seen[int(d.sensor)] = (d.pos[0] * pos_scale, d.pos[1] * pos_scale, d.pos[2] * pos_scale)
+
+  cb = cb_type(_cb)
+  dll.CMVrpnStartExtern()
+  try:
+    dll.CMVrpnEnableLog(False)
+  except Exception:  # noqa: BLE001
+    pass
+  dll.CMPluginConnectServer(hostb)
+  dll.CMPluginRegisterTrackerData(hostb, None, cb)
+  print(f"[Probe] listening {seconds:.0f}s on {host} — move each limb to identify ids…")
+  t0 = time.time()
+  while time.time() - t0 < seconds:
+    dll.CMPluginRegisterTrackerData(hostb, None, cb)
+    time.sleep(0.05)
+    with lock:
+      ids = sorted(seen)
+    print(f"\r[Probe] {len(ids)} sensor ids: {ids}   ", end="", flush=True)
+  print("\n[Probe] final snapshot (sensor_id -> position m):")
+  with lock:
+    for sid in sorted(seen):
+      x, y, z = seen[sid]
+      print(f"   {sid:4d}  ({x:+.3f}, {y:+.3f}, {z:+.3f})")
+  print("[Probe] map these ids to the 14 smplx names in --body-map, then drop --probe.")
+
+
 def _resolve_gmr_class(pkg):
   """The retargeter class, tolerant of fork naming (GeneralMotionRetargeting/GMR)."""
   for name in ("GeneralMotionRetargeting", "GMR"):
@@ -250,11 +292,25 @@ def _resolve_robot_xml(pkg, robot: str, override: Optional[str]) -> str:
 
 
 def run(args: argparse.Namespace) -> None:
+  # Sensor discovery needs neither GMR nor a body-map — do it first and exit.
+  if args.probe:
+    _probe_sensors(args.chingmu_dll, args.chingmu_host, args.probe_seconds, args.pos_scale)
+    return
+  if not args.body_map:
+    raise SystemExit("--body-map is required (or use --probe to discover sensor ids).")
+
   import redis
   import general_motion_retargeting as gmr_pkg  # gmr env only
 
   GMR = _resolve_gmr_class(gmr_pkg)
   robot_xml = _resolve_robot_xml(gmr_pkg, args.robot, args.robot_xml)
+
+  ik_srcs = getattr(gmr_pkg, "IK_CONFIG_DICT", {})
+  if ik_srcs and args.src_human not in ik_srcs:
+    raise SystemExit(
+      f"--src-human {args.src_human!r} not available in this GMR build. "
+      f"Options: {list(ik_srcs)}. For live ChingMu streaming use 'smplx'."
+    )
 
   body_map = json.loads(open(args.body_map, encoding="utf-8").read())
   reader = ChingMuSkeletonReader(
@@ -340,11 +396,13 @@ def _build_argparser() -> argparse.ArgumentParser:
   p = argparse.ArgumentParser(description="GMR retarget server: ChingMu human skeleton -> robot qpos -> redis.")
   p.add_argument("--chingmu-host", type=str, required=True, help="e.g. MCAvatar@192.168.123.112")
   p.add_argument("--chingmu-dll", type=str, required=True, help="Path to libCMVrpn.so.")
-  p.add_argument("--body-map", type=str, required=True, help="JSON {chingmu_sensor_id: gmr_body_name}.")
+  p.add_argument("--body-map", type=str, default=None, help="JSON {chingmu_sensor_id: gmr_body_name}. Required unless --probe.")
+  p.add_argument("--probe", action="store_true", help="Print live ChingMu sensor ids and exit (to build --body-map). No GMR needed.")
+  p.add_argument("--probe-seconds", type=float, default=15.0)
   p.add_argument("--pos-scale", type=float, default=0.001, help="ChingMu position units -> metres (mm=0.001).")
   p.add_argument("--robot", type=str, default="unitree_g1", help="GMR tgt_robot key (ROBOT_XML_DICT).")
   p.add_argument("--robot-xml", type=str, default=None, help="Robot MJCF path; overrides ROBOT_XML_DICT if the fork lacks it.")
-  p.add_argument("--src-human", type=str, default="xrobot", help="GMR src_human preset for your input skeleton.")
+  p.add_argument("--src-human", type=str, default="smplx", help="GMR src_human preset. 'smplx' for live ChingMu; fork has no 'xrobot'.")
   p.add_argument("--actual-human-height", type=float, default=1.6, help="Operator height (m); GMR scales to it.")
   p.add_argument("--target-fps", type=float, default=100.0)
   p.add_argument("--smooth", type=float, default=0.5, help="EMA alpha on retargeted joints [0,1). 0=off.")

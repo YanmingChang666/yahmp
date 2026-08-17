@@ -1,0 +1,33 @@
+{
+  "_comment": "ChingMu human-skeleton sensor id -> GMR smplx body name. Keys are ChingMu VRPN integer sensor ids (from your ChingMu software's segment numbering); values MUST be one of the 14 names GMR's smplx src expects. Keys starting with '_' are ignored (docs). REPLACE the placeholder ids below (0-13) with YOUR ChingMu sensor ids, then run retarget_server_gmr.py --src-human smplx.",
+  "_mapping_guide_smplx_name_from_chingmu_segment": {
+    "pelvis": "Hips",
+    "spine3": "Spine2 / Chest (upper spine)",
+    "left_hip": "LeftUpLeg (left thigh)",
+    "left_knee": "LeftLeg (left shin)",
+    "left_foot": "LeftFoot",
+    "right_hip": "RightUpLeg",
+    "right_knee": "RightLeg",
+    "right_foot": "RightFoot",
+    "left_shoulder": "LeftArm (upper arm)",
+    "left_elbow": "LeftForeArm",
+    "left_wrist": "LeftHand",
+    "right_shoulder": "RightArm",
+    "right_elbow": "RightForeArm",
+    "right_wrist": "RightHand"
+  },
+  "0": "pelvis",
+  "1": "spine3",
+  "2": "left_hip",
+  "3": "left_knee",
+  "4": "left_foot",
+  "5": "right_hip",
+  "6": "right_knee",
+  "7": "right_foot",
+  "8": "left_shoulder",
+  "9": "left_elbow",
+  "10": "left_wrist",
+  "11": "right_shoulder",
+  "12": "right_elbow",
+  "13": "right_wrist"
+}
