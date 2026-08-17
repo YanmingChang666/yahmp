@@ -130,16 +130,22 @@ class _VrpnTracker(ctypes.Structure):
 
 
 class ChingMuSkeletonReader:
-  """Reads ChingMu human-skeleton segments over the CMTrackerExternTC POLLING
-  API (indexed by body_id, as TTRL's WaistBodyPollerLive does) into
-  `{body_name: (pos_m[3], quat_xyzw[4])}` per `body_map`.
+  """Reads ChingMu human-skeleton segments over the CMPluginRegisterTrackerData
+  CALLBACK API (as `callback_data.py` / the yahmp `ChingMuMocapSource` do) into
+  `{gmr_body_name: (pos_m[3], quat_xyzw[4])}` per `body_map`.
 
-  The polling API (not the tracker-data callback) is where the human skeleton
-  lives — the callback only carries rigid bodies. `body_map` therefore maps
-  ChingMu **body_id** (from --probe-poll) → GMR smplx body name.
+  ChingMu streams the human skeleton on the tracker-data **callback** at high
+  sensor ids (e.g. 300-322), NOT the CMTrackerExternTC polling API the previous
+  revision used (that returned 0 segments). Each segment reports a position (mm)
+  plus an orientation. On this stream the orientation arrives as Euler angles /
+  a rotation vector (radians) in `quat[0:3]` with `quat[3] == 0` (not a unit
+  quaternion), so we convert it to a proper quaternion (xyzw) before handing data
+  to GMR (which calls `R.from_quat`). Positions drive most of GMR's IK, so a
+  working retarget survives an imperfect rotation convention — tune `--rot-format`
+  / `--euler-order` if limbs twist.
 
-  Unlike the yahmp `ChingMuMocapSource` (which reads pre-retargeted *robot* joint
-  angles), this reads the raw *human* body poses that GMR needs as its input.
+  `body_map` maps ChingMu **sensor id** (from --probe / callback_data.py) → GMR
+  smplx body name (the ik_match_table1 entries).
   """
 
   def __init__(
@@ -149,21 +155,52 @@ class ChingMuSkeletonReader:
     body_map: dict[int, str],
     *,
     pos_scale: float = 0.001,
-    poll_hz: float = 200.0,
+    rot_format: str = "euler",
+    euler_order: str = "XYZ",
     encoding: str = "gbk",
   ) -> None:
     self._dll = ctypes.CDLL(dll_path)
     self._host = bytes(host, encoding)
-    # Keys prefixed with "_" are documentation (e.g. "_comment"), not body_ids.
+    # Keys prefixed with "_" are documentation (e.g. "_comment"), not sensor ids.
     self._body_map = {
       int(k): str(v) for k, v in body_map.items() if not str(k).startswith("_")
     }
     self._scale = float(pos_scale)
-    self._poll_dt = 1.0 / max(poll_hz, 1.0)
+    self._rot_format = str(rot_format)
+    self._euler_order = str(euler_order)
     self._lock = threading.Lock()
     self._bodies: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    self._cb_type = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.POINTER(_VrpnTracker))
+    self._cb = self._cb_type(self._on_tracker)  # keep a ref so it is not GC'd
     self._running = False
     self._thread: Optional[threading.Thread] = None
+
+  def _to_quat_xyzw(self, r: np.ndarray) -> np.ndarray:
+    """Source orientation `[rx, ry, rz, rw]` → unit quaternion xyzw for GMR."""
+    from scipy.spatial.transform import Rotation
+
+    if self._rot_format == "quat" and abs(float(r[3])) > 1e-9:
+      q = np.asarray(r, dtype=np.float64)
+      n = float(np.linalg.norm(q))
+      return q / n if n > 1e-12 else np.array([0.0, 0.0, 0.0, 1.0])
+    v = np.asarray(r[:3], dtype=np.float64)
+    if self._rot_format == "rotvec":
+      return Rotation.from_rotvec(v).as_quat()
+    return Rotation.from_euler(self._euler_order.lower(), v).as_quat()  # xyzw
+
+  def _on_tracker(self, _ptr, b) -> None:
+    d = b.contents
+    name = self._body_map.get(int(d.sensor))
+    if name is None:
+      return  # a sensor id we do not map (e.g. spine1/2, neck, head, collars)
+    pos = np.array(
+      [d.pos[0] * self._scale, d.pos[1] * self._scale, d.pos[2] * self._scale]
+    )
+    quat_xyzw = self._to_quat_xyzw(
+      np.array([d.quat[0], d.quat[1], d.quat[2], d.quat[3]])
+    )
+    with self._lock:
+      self._bodies[name] = (pos, quat_xyzw)
 
   def start(self) -> None:
     self._dll.CMVrpnStartExtern()
@@ -171,29 +208,21 @@ class ChingMuSkeletonReader:
       self._dll.CMVrpnEnableLog(False)
     except Exception:  # noqa: BLE001
       pass
+    time.sleep(1.5)  # let the VRPN thread connect first (segfaults without it)
+    self._dll.CMPluginConnectServer(self._host)
+    self._dll.CMPluginRegisterTrackerData(self._host, None, self._cb)
     self._running = True
     self._thread = threading.Thread(target=self._loop, daemon=True)
     self._thread.start()
-    print(f"[ChingMu] polling {len(self._body_map)} skeleton body_ids from "
-          f"{self._host.decode(errors='replace')}")
+    print(
+      f"[ChingMu] callback stream from {self._host.decode(errors='replace')}; "
+      f"mapping {len(self._body_map)} sensor ids {sorted(self._body_map)}"
+    )
 
   def _loop(self) -> None:
-    body_pos = (ctypes.c_double * 3)()
-    body_rot = (ctypes.c_double * 4)()  # xyzw
-    timecode = (ctypes.c_int * 1)()
-    tv = _Timeval()
-    s = self._scale
     while self._running:
-      for bid, name in self._body_map.items():
-        det = self._dll.CMTrackerExternTC(
-          self._host, bid, timecode, body_pos, body_rot, ctypes.byref(tv)
-        )
-        if det:
-          pos = np.array([body_pos[0] * s, body_pos[1] * s, body_pos[2] * s])
-          quat_xyzw = np.array([body_rot[0], body_rot[1], body_rot[2], body_rot[3]])
-          with self._lock:
-            self._bodies[name] = (pos, quat_xyzw)
-      time.sleep(self._poll_dt)
+      self._dll.CMPluginRegisterTrackerData(self._host, None, self._cb)
+      time.sleep(0.001)
 
   def get_human_data(self) -> Optional[dict]:
     """Return the GMR `human_data` dict, or None until all segments are seen."""
@@ -373,6 +402,8 @@ def run(args: argparse.Namespace) -> None:
     host=args.chingmu_host,
     body_map=body_map,
     pos_scale=args.pos_scale,
+    rot_format=args.rot_format,
+    euler_order=args.euler_order,
   )
   # NOTE: TWIST2's constructor is GMR(src_human=, tgt_robot=, actual_human_height=).
   # If your droid_gmr fork differs, the TypeError names the expected args — send it over.
@@ -466,6 +497,8 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--probe-max-body", type=int, default=40, help="Highest body_id to poll in --probe-poll.")
   p.add_argument("--probe-seconds", type=float, default=15.0)
   p.add_argument("--pos-scale", type=float, default=0.001, help="ChingMu position units -> metres (mm=0.001).")
+  p.add_argument("--rot-format", choices=("euler", "rotvec", "quat"), default="euler", help="How the ChingMu callback encodes segment orientation. Human-skeleton streams send Euler radians with rw=0 (default); use 'quat' only if rw is a real unit quaternion.")
+  p.add_argument("--euler-order", type=str, default="XYZ", help="Euler axis order for --rot-format euler (scipy convention, e.g. XYZ, ZYX). Tune if limbs twist.")
   p.add_argument("--robot", type=str, default="unitree_g1", help="GMR tgt_robot key (ROBOT_XML_DICT).")
   p.add_argument("--robot-xml", type=str, default=None, help="Robot MJCF path; overrides ROBOT_XML_DICT if the fork lacks it.")
   p.add_argument("--src-human", type=str, default="smplx", help="GMR src_human preset. 'smplx' for live ChingMu; fork has no 'xrobot'.")
