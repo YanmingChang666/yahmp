@@ -1,0 +1,10 @@
+{
+  "label": "euler_XYZ",
+  "key": "yahmp:mocap:pose",
+  "host": "localhost",
+  "port": 6379,
+  "db": 0,
+  "seconds": 15.0,
+  "poll_hz": 100.0,
+  "timestamp": "20260818_003940"
+}
