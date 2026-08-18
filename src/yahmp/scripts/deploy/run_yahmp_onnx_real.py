@@ -387,6 +387,7 @@ def run(
   calibrate: str = "",
   calibrate_seconds: float = 3.0,
   calibrate_height_target: float = 0.793,
+  track_legs_only: bool = False,
   dof2motor: Optional[np.ndarray] = None,
   lowcmd_topic: str,
   lowstate_topic: str,
@@ -446,8 +447,11 @@ def run(
   if calibration is not None:
     print(f"[INFO] mocap calibration loaded from {mocap_calibration}")
   reference = LiveReference(
-    state, spec, joint_order, vel_smoothing=vel_smoothing, calibration=calibration
+    state, spec, joint_order, vel_smoothing=vel_smoothing, calibration=calibration,
+    track_legs_only=track_legs_only,
   )
+  if track_legs_only:
+    print("[INFO] track-legs-only: waist + arms held at default; tracking legs only.")
   reference.wait_for_detection(timeout_s=15.0)
 
   # ── Robot bring-up ─────────────────────────────────────────────────────────
@@ -597,6 +601,7 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--kd-scale", type=float, default=1.0, help="Scale trained Kd (start small, e.g. 0.5).")
   p.add_argument("--target-ema", type=float, default=1.0, help="EMA on the commanded target: weight of the new sample each step, (0,1]. 1.0=off. Try 0.3-0.5 to suppress high-frequency action chatter.")
   p.add_argument("--target-max-rate", type=float, default=0.0, help="Per-joint slew-rate cap on the target in rad/s. 0=off. e.g. 6.0 -> ~6.9 deg per 20ms step.")
+  p.add_argument("--track-legs-only", action="store_true", help="Hold waist + arms at the robot default and track only the legs from mocap (isolates an off-default upper-body command as a balance destabilizer).")
   # Mocap neutral-pose calibration
   p.add_argument("--mocap-calibration", type=str, default="", help="Path to a neutral-pose calibration JSON (from --calibrate) to apply to the live command.")
   p.add_argument("--calibrate", type=str, default="", help="CAPTURE mode: operator stands neutral; write a calibration JSON to this path and exit (robot NOT energized).")
@@ -687,6 +692,7 @@ def main() -> None:
     target_ema=float(args.target_ema),
     target_max_rate=float(args.target_max_rate),
     mocap_calibration=str(args.mocap_calibration),
+    track_legs_only=bool(args.track_legs_only),
     calibrate=str(args.calibrate),
     calibrate_seconds=float(args.calibrate_seconds),
     calibrate_height_target=float(args.calibrate_height_target),

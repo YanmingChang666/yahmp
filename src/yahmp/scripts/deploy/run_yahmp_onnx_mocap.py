@@ -261,11 +261,29 @@ class LiveReference:
     *,
     vel_smoothing: float = 0.0,
     calibration: Optional[MocapCalibration] = None,
+    track_legs_only: bool = False,
   ) -> None:
     self._state = state
     self._spec = spec
     self._alpha = float(np.clip(vel_smoothing, 0.0, 0.99))
     self._calib = calibration
+
+    # `--track-legs-only`: hold every non-leg joint (waist + arms) at the robot
+    # default and only track the legs (hip/knee/ankle) from mocap, so an off-
+    # default upper-body command can't shift the CoM and tip the policy over.
+    self._default_jp = np.asarray(spec.default_joint_pos, dtype=np.float64)
+    self._hold_idx = (
+      np.asarray(
+        [
+          i
+          for i, name in enumerate(spec.joint_names)
+          if not any(k in name for k in ("hip", "knee", "ankle"))
+        ],
+        dtype=np.int32,
+      )
+      if track_legs_only
+      else np.empty(0, dtype=np.int32)
+    )
 
     if source_joint_order is None:
       if len(spec.joint_names) != state.joint_pos.shape[0]:
@@ -326,6 +344,15 @@ class LiveReference:
       joint_vel, root_lin_vel, root_ang_vel = self._vel_jp, self._vel_lin, self._vel_ang
 
     self._prev = (now, joint_pos.copy(), root_pos.copy(), root_quat.copy())
+
+    # Legs-only: pin the held (non-leg) joints to default with zero velocity, so
+    # the command + residual base both say "hold arms/waist at default".
+    if self._hold_idx.size:
+      joint_pos = joint_pos.copy()
+      joint_vel = np.asarray(joint_vel, dtype=np.float64).copy()
+      joint_pos[self._hold_idx] = self._default_jp[self._hold_idx]
+      joint_vel[self._hold_idx] = 0.0
+
     # MotionFrame feeds the policy's `command` term (dim 2N+6 = 64 for g1_yahmp):
     #   joint_pos/joint_vel -> ref joint angles/vels (N=29 each)
     #   root_* -> anchor planar vel (2), yaw rate (1), height (1), roll/pitch (2)
@@ -1310,6 +1337,7 @@ def run(
   vel_smoothing: float,
   mocap_calibration: str = "",
   calibrate_height_target: float = 0.793,
+  track_legs_only: bool = False,
   redis_kwargs: Optional[dict] = None,
   record: str = "",
   record_steps: int = 0,
@@ -1363,7 +1391,10 @@ def run(
     joint_order,
     vel_smoothing=vel_smoothing,
     calibration=(None if mode == "calibrate" else calibration),
+    track_legs_only=track_legs_only,
   )
+  if track_legs_only:
+    print("[INFO] track-legs-only: waist + arms held at default; tracking legs only.")
   reference.wait_for_detection(timeout_s=15.0)
 
   if record and mode != "teleop":
@@ -1547,6 +1578,7 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--vel-smoothing", type=float, default=0.0, help="EMA factor [0,1) for finite-diff velocities.")
   p.add_argument("--mocap-calibration", type=str, default="", help="Neutral-pose calibration JSON to apply (teleop/replay) or build/save (--mode calibrate).")
   p.add_argument("--calibrate-height-target", type=float, default=0.793, help="Nominal pelvis height (m) neutral maps to in --mode calibrate. G1 default ~0.793.")
+  p.add_argument("--track-legs-only", action="store_true", help="Hold waist + arms at the robot default and track only the legs from mocap (isolates an off-default upper-body command as a balance destabilizer).")
   # NPZ mock
   p.add_argument("--npz-clip", type=Path, default=None)
   # ChingMu
@@ -1647,6 +1679,7 @@ def main() -> None:
     vel_smoothing=float(args.vel_smoothing),
     mocap_calibration=str(args.mocap_calibration),
     calibrate_height_target=float(args.calibrate_height_target),
+    track_legs_only=bool(args.track_legs_only),
     redis_kwargs=redis_kwargs,
     record=str(args.record),
     record_steps=int(args.record_steps),
