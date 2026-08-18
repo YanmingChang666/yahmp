@@ -157,6 +157,7 @@ class ChingMuSkeletonReader:
     pos_scale: float = 0.001,
     rot_format: str = "euler",
     euler_order: str = "XYZ",
+    world_up: str = "z",
     encoding: str = "gbk",
   ) -> None:
     self._dll = ctypes.CDLL(dll_path)
@@ -168,6 +169,9 @@ class ChingMuSkeletonReader:
     self._scale = float(pos_scale)
     self._rot_format = str(rot_format)
     self._euler_order = str(euler_order)
+    self._world_up = str(world_up).lower()
+    self._Rot = None  # scipy Rotation module handle (lazy)
+    self._Rw = None   # src-world → GMR-world (Y-up) rotation (lazy)
     self._lock = threading.Lock()
     self._bodies: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     self._cb_type = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.POINTER(_VrpnTracker))
@@ -175,30 +179,50 @@ class ChingMuSkeletonReader:
     self._running = False
     self._thread: Optional[threading.Thread] = None
 
-  def _to_quat_xyzw(self, r: np.ndarray) -> np.ndarray:
-    """Source orientation `[rx, ry, rz, rw]` → unit quaternion xyzw for GMR."""
+  def _ensure_rot(self) -> None:
+    """Lazily grab the scipy handle + the src-world → GMR-world (Y-up) rotation.
+
+    ChingMu is Z-up but GMR/SMPL-X is Y-up; without this the skeleton retargets
+    lying flat (root pitched ~90°, height collapsed). Rotating the whole skeleton
+    so the source up-axis maps to +Y fixes it.
+    """
+    if self._Rot is not None:
+      return
     from scipy.spatial.transform import Rotation
 
+    self._Rot = Rotation
+    if self._world_up == "z":      # ChingMu Z-up → GMR Y-up
+      self._Rw = Rotation.from_euler("x", -90.0, degrees=True)
+    elif self._world_up == "x":    # X-up → Y-up
+      self._Rw = Rotation.from_euler("z", 90.0, degrees=True)
+    else:                          # already Y-up: no world rotation
+      self._Rw = Rotation.identity()
+
+  def _to_quat_xyzw(self, r: np.ndarray) -> np.ndarray:
+    """Source orientation `[rx, ry, rz, rw]` → unit quaternion xyzw (src world)."""
     if self._rot_format == "quat" and abs(float(r[3])) > 1e-9:
       q = np.asarray(r, dtype=np.float64)
       n = float(np.linalg.norm(q))
       return q / n if n > 1e-12 else np.array([0.0, 0.0, 0.0, 1.0])
     v = np.asarray(r[:3], dtype=np.float64)
     if self._rot_format == "rotvec":
-      return Rotation.from_rotvec(v).as_quat()
-    return Rotation.from_euler(self._euler_order.lower(), v).as_quat()  # xyzw
+      return self._Rot.from_rotvec(v).as_quat()
+    return self._Rot.from_euler(self._euler_order.lower(), v).as_quat()  # xyzw
 
   def _on_tracker(self, _ptr, b) -> None:
     d = b.contents
     name = self._body_map.get(int(d.sensor))
     if name is None:
       return  # a sensor id we do not map (e.g. spine1/2, neck, head, collars)
+    self._ensure_rot()
+    # Position (mm→m) + orientation in the src world, then rotate the whole
+    # skeleton src-world → GMR world (Y-up) so "up" is not read as horizontal.
     pos = np.array(
       [d.pos[0] * self._scale, d.pos[1] * self._scale, d.pos[2] * self._scale]
     )
-    quat_xyzw = self._to_quat_xyzw(
-      np.array([d.quat[0], d.quat[1], d.quat[2], d.quat[3]])
-    )
+    q_src = self._to_quat_xyzw(np.array([d.quat[0], d.quat[1], d.quat[2], d.quat[3]]))
+    pos = self._Rw.apply(pos)
+    quat_xyzw = np.asarray((self._Rw * self._Rot.from_quat(q_src)).as_quat(), dtype=np.float64)
     with self._lock:
       self._bodies[name] = (pos, quat_xyzw)
 
@@ -404,6 +428,7 @@ def run(args: argparse.Namespace) -> None:
     pos_scale=args.pos_scale,
     rot_format=args.rot_format,
     euler_order=args.euler_order,
+    world_up=args.world_up,
   )
   # NOTE: TWIST2's constructor is GMR(src_human=, tgt_robot=, actual_human_height=).
   # If your droid_gmr fork differs, the TypeError names the expected args — send it over.
@@ -499,6 +524,7 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--pos-scale", type=float, default=0.001, help="ChingMu position units -> metres (mm=0.001).")
   p.add_argument("--rot-format", choices=("euler", "rotvec", "quat"), default="euler", help="How the ChingMu callback encodes segment orientation. Human-skeleton streams send Euler radians with rw=0 (default); use 'quat' only if rw is a real unit quaternion.")
   p.add_argument("--euler-order", type=str, default="XYZ", help="Euler axis order for --rot-format euler (scipy convention, e.g. XYZ, ZYX). Tune if limbs twist.")
+  p.add_argument("--world-up", choices=("z", "y", "x"), default="z", help="Source (ChingMu) world up-axis; the skeleton is rotated so this maps to GMR's +Y (SMPL-X up). ChingMu is Z-up (default). Use 'y' to disable the rotation if the robot already stands upright.")
   p.add_argument("--robot", type=str, default="unitree_g1", help="GMR tgt_robot key (ROBOT_XML_DICT).")
   p.add_argument("--robot-xml", type=str, default=None, help="Robot MJCF path; overrides ROBOT_XML_DICT if the fork lacks it.")
   p.add_argument("--src-human", type=str, default="smplx", help="GMR src_human preset. 'smplx' for live ChingMu; fork has no 'xrobot'.")
