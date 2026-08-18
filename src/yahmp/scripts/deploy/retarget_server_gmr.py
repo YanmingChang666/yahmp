@@ -451,6 +451,16 @@ def run(args: argparse.Namespace) -> None:
   r.ping()
   print(f"[Redis] publishing to {args.redis_key!r} @ {args.target_fps:.0f} Hz")
 
+  # Fixed correction applied to the PUBLISHED root orientation (world frame).
+  # Use it when GMR emits the root in its own frame (e.g. Y-up) so the pelvis
+  # comes out tilted ~90° even though positions/height are already right.
+  from scipy.spatial.transform import Rotation as _R
+
+  _rf = [float(v) for v in str(args.root_rot_offset).split(",")]
+  rot_fix = _R.from_euler("xyz", _rf, degrees=True) if any(abs(v) > 1e-9 for v in _rf) else None
+  if rot_fix is not None:
+    print(f"[GMR] root output rotation offset (world, deg): {_rf}")
+
   pos_ema = EMA(args.smooth)
   vel_ema = EMA(max(args.smooth, 0.5))  # velocities are noisier; smooth them harder
   reader.start()
@@ -481,6 +491,10 @@ def run(args: argparse.Namespace) -> None:
       qpos = np.asarray(retarget.retarget(human, offset_to_ground=True), dtype=np.float64)
       root_pos = qpos[0:3]
       root_quat = qpos[3:7]  # MuJoCo wxyz
+      if rot_fix is not None:  # rotate the published root into the MuJoCo frame
+        q_xyzw = [root_quat[1], root_quat[2], root_quat[3], root_quat[0]]
+        q_new = (rot_fix * _R.from_quat(q_xyzw)).as_quat()  # xyzw
+        root_quat = np.array([q_new[3], q_new[0], q_new[1], q_new[2]])  # -> wxyz
       q_joints = qpos[joint_adr]
 
       # Engage ramp: blend default → live over --ramp-seconds on first detection.
@@ -532,6 +546,7 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--rot-format", choices=("euler", "rotvec", "quat", "identity"), default="euler", help="How the ChingMu callback encodes segment orientation. 'euler' (radians, rw=0) is the default; 'quat' only if rw is a real unit quaternion; 'identity' ignores the source orientation and feeds GMR canonical upright quats so position IK alone stands the robot (best first test if it retargets lying down).")
   p.add_argument("--euler-order", type=str, default="XYZ", help="Euler axis order for --rot-format euler (scipy convention, e.g. XYZ, ZYX). Tune if limbs twist.")
   p.add_argument("--world-up", choices=("z", "y", "x"), default="z", help="Source (ChingMu) world up-axis; the skeleton is rotated so this maps to GMR's +Y (SMPL-X up). ChingMu is Z-up (default). Use 'y' to disable the rotation if the robot already stands upright.")
+  p.add_argument("--root-rot-offset", type=str, default="0,0,0", help="Fixed rx,ry,rz (deg) applied to the PUBLISHED root orientation (world frame). Corrects GMR's output frame when positions/height are right but the pelvis is tilted ~90°, e.g. '90,0,0' or '-90,0,0'.")
   p.add_argument("--robot", type=str, default="unitree_g1", help="GMR tgt_robot key (ROBOT_XML_DICT).")
   p.add_argument("--robot-xml", type=str, default=None, help="Robot MJCF path; overrides ROBOT_XML_DICT if the fork lacks it.")
   p.add_argument("--src-human", type=str, default="smplx", help="GMR src_human preset. 'smplx' for live ChingMu; fork has no 'xrobot'.")
