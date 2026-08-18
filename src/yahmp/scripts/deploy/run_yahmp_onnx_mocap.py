@@ -262,11 +262,15 @@ class LiveReference:
     vel_smoothing: float = 0.0,
     calibration: Optional[MocapCalibration] = None,
     track_legs_only: bool = False,
+    track_gain: float = 1.0,
   ) -> None:
     self._state = state
     self._spec = spec
     self._alpha = float(np.clip(vel_smoothing, 0.0, 0.99))
     self._calib = calibration
+    # Command blend toward default: ref = default + gain*(mocap - default).
+    # gain<1 trades imitation accuracy for stability (policy favors balance).
+    self._gain = float(np.clip(track_gain, 0.0, 1.0))
 
     # `--track-legs-only`: hold every non-leg joint (waist + arms) at the robot
     # default and only track the legs (hip/knee/ankle) from mocap, so an off-
@@ -325,6 +329,13 @@ class LiveReference:
     # joint bias is constant, so joint/root velocities are unaffected.
     if self._calib is not None:
       joint_pos, root_pos, root_quat = self._calib.apply(joint_pos, root_pos, root_quat)
+
+    # Reduce tracking: pull the joint reference toward default (and scale the base
+    # roll/pitch the same way), so wild/noisy mocap can't drag the policy over.
+    if self._gain != 1.0:
+      joint_pos = self._default_jp + self._gain * (joint_pos - self._default_jp)
+      roll, pitch, yaw = _quat_roll_pitch_yaw(root_quat)
+      root_quat = _quat_from_euler(self._gain * roll, self._gain * pitch, yaw)
 
     now = time.perf_counter()
     if self._prev is None:
@@ -1338,6 +1349,7 @@ def run(
   mocap_calibration: str = "",
   calibrate_height_target: float = 0.793,
   track_legs_only: bool = False,
+  track_gain: float = 1.0,
   redis_kwargs: Optional[dict] = None,
   record: str = "",
   record_steps: int = 0,
@@ -1392,9 +1404,12 @@ def run(
     vel_smoothing=vel_smoothing,
     calibration=(None if mode == "calibrate" else calibration),
     track_legs_only=track_legs_only,
+    track_gain=track_gain,
   )
   if track_legs_only:
     print("[INFO] track-legs-only: waist + arms held at default; tracking legs only.")
+  if track_gain != 1.0:
+    print(f"[INFO] track-gain={track_gain:.2f}: command blended toward default (reduced tracking).")
   reference.wait_for_detection(timeout_s=15.0)
 
   if record and mode != "teleop":
@@ -1579,6 +1594,7 @@ def _build_argparser() -> argparse.ArgumentParser:
   p.add_argument("--mocap-calibration", type=str, default="", help="Neutral-pose calibration JSON to apply (teleop/replay) or build/save (--mode calibrate).")
   p.add_argument("--calibrate-height-target", type=float, default=0.793, help="Nominal pelvis height (m) neutral maps to in --mode calibrate. G1 default ~0.793.")
   p.add_argument("--track-legs-only", action="store_true", help="Hold waist + arms at the robot default and track only the legs from mocap (isolates an off-default upper-body command as a balance destabilizer).")
+  p.add_argument("--track-gain", type=float, default=1.0, help="Blend the command toward the robot default: ref = default + gain*(mocap-default), gain in [0,1]. 1=full tracking, 0=hold default. Lower it to trade imitation for stability.")
   # NPZ mock
   p.add_argument("--npz-clip", type=Path, default=None)
   # ChingMu
@@ -1680,6 +1696,7 @@ def main() -> None:
     mocap_calibration=str(args.mocap_calibration),
     calibrate_height_target=float(args.calibrate_height_target),
     track_legs_only=bool(args.track_legs_only),
+    track_gain=float(args.track_gain),
     redis_kwargs=redis_kwargs,
     record=str(args.record),
     record_steps=int(args.record_steps),
