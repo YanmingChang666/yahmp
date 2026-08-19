@@ -41,15 +41,21 @@ from collections import deque
 from pathlib import Path
 from typing import Optional
 
+import mujoco
 import numpy as np
 
+from yahmp.scripts.deploy.mocap_calibration_gui import run_gui_joint_calibration
 from yahmp.scripts.deploy.run_twist2_onnx_mujoco import (
   CONTROL_PROFILES,
+  DEFAULT_MJLAB_TASK_ID,
   TWIST2_DEFAULT_DOF_POS,
   TWIST2_G1_JOINT_NAMES,
+  _build_task_scene,
   _create_onnx_session,
   _init_history,
+  _joint_addresses,
   _onnx_input_dim,
+  _root_addresses,
 )
 from yahmp.scripts.deploy.run_yahmp_onnx_mocap import (
   ChingMuMocapSource,
@@ -134,14 +140,30 @@ def run(
     raise ValueError(f"Unknown --source {source_kind!r}.")
   source.start()
 
-  # ── Calibration capture (operator stands neutral; robot NOT energized) ───────
+  # ── Calibration (operator stands neutral; robot NOT energized) ───────────────
+  # Interactive MuJoCo GUI: per-joint offset sliders + root R/P/Y + height, with
+  # the automatic neutral-pose capture kept as a button. Falls back to headless
+  # auto-capture when no display/tkinter is available.
   if calibrate:
     raw_reference = LiveReference(state, spec, joint_order, vel_smoothing=0.0)
+    seed = MocapCalibration.load(calibrate, spec) if Path(calibrate).is_file() else None
     try:
-      capture_calibration(
-        raw_reference, spec, seconds=calibrate_seconds,
-        height_target=calibrate_height_target, out_path=calibrate,
+      raw_reference.wait_for_detection(timeout_s=15.0)
+      model, viewer_cfg, _physics_dt, _control_dt = _build_task_scene(DEFAULT_MJLAB_TASK_ID)
+      data = mujoco.MjData(model)
+      joint_qpos_adr, _jqv = _joint_addresses(model, TWIST2_G1_JOINT_NAMES)
+      root_qpos_adr, _rqv = _root_addresses(model, "pelvis")
+      ran = run_gui_joint_calibration(
+        model=model, data=data, spec=spec, reference=raw_reference, viewer_cfg=viewer_cfg,
+        joint_qpos_adr=joint_qpos_adr, root_qpos_adr=root_qpos_adr, out_path=calibrate,
+        height_target=calibrate_height_target, seed=seed, root_body_name="pelvis",
+        title="TWIST2 mocap calibration — per-joint offsets",
       )
+      if not ran:
+        capture_calibration(
+          raw_reference, spec, seconds=calibrate_seconds,
+          height_target=calibrate_height_target, out_path=calibrate,
+        )
     finally:
       source.stop()
     print(f"[Calibrate] done (robot NOT energized). Re-run with "
