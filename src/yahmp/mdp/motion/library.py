@@ -344,6 +344,25 @@ def _fk_body_kinematics(
   return body_pos_w, _quat_normalize_np(body_quat_w).astype(np.float32), body_names
 
 
+def _default_g1_body_names(*, source: Path, num_bodies: int) -> tuple[str, ...]:
+  """Recover `body_names` for a clip that ships body kinematics but omits names.
+
+  Motions exported by `whole_body_tracking` store `body_pos_w`/`body_quat_w`
+  in the mjlab G1 body order but do not persist the body names, so they skip the
+  FK branch (which is the only other place names are populated). Fall back to the
+  canonical G1 model names, guarding on body count so a clip whose layout does
+  not match fails loudly instead of being silently mislabeled.
+  """
+  *_, body_names = _cached_g1_fk_context()
+  if len(body_names) != num_bodies:
+    raise ValueError(
+      f"{source} provides body kinematics for {num_bodies} bodies but no "
+      f"`body_names`, and the canonical G1 model has {len(body_names)} bodies. "
+      "Add a `body_names` array (or a meta.json sidecar) to the clip."
+    )
+  return body_names
+
+
 def _finalize_motion_data(raw: RawMotionData, *, source: Path) -> LoadedMotionData:
   fps = _normalize_fps(raw.fps)
   dt = 1.0 / fps
@@ -408,6 +427,10 @@ def _finalize_motion_data(raw: RawMotionData, *, source: Path) -> LoadedMotionDa
       root_pos=root_pos,
       root_quat_w=root_quat_w,
       joint_pos=joint_pos,
+    )
+  elif body_names is None:
+    body_names = _default_g1_body_names(
+      source=source, num_bodies=body_pos_w.shape[1]
     )
 
   assert body_names is not None
